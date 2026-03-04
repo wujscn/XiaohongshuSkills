@@ -1041,6 +1041,102 @@ class XiaohongshuPublisher:
             "feeds": feeds,
         }
 
+    def home_feeds(self, limit: int = 60, scroll_rounds: int = 6) -> dict[str, Any]:
+        """
+        Browse Xiaohongshu home explore feed and extract feed cards from page DOM.
+
+        Returns:
+            {
+                "count": int,
+                "feeds": list[dict[str, Any]],
+            }
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        limit = max(1, min(int(limit), 200))
+        scroll_rounds = max(0, min(int(scroll_rounds), 20))
+
+        self._navigate(XHS_HOME_URL)
+        self._sleep(2, minimum_seconds=1.0)
+
+        seen: set[str] = set()
+        collected: list[dict[str, Any]] = []
+
+        extract_js = """
+            (() => {
+                const out = [];
+                const anchors = document.querySelectorAll('a[href*="/explore/"]');
+                for (const a of anchors) {
+                    if (!(a instanceof HTMLAnchorElement)) continue;
+                    const href = a.getAttribute("href") || "";
+                    if (!href.includes("/explore/")) continue;
+                    const abs = a.href || href;
+
+                    let feedId = "";
+                    const m = abs.match(/\\/explore\\/([0-9a-zA-Z]+)/);
+                    if (m && m[1]) feedId = m[1];
+                    if (!feedId) continue;
+
+                    let xsecToken = "";
+                    try {
+                        const u = new URL(abs, location.origin);
+                        xsecToken = u.searchParams.get("xsec_token") || "";
+                    } catch (_) {}
+
+                    const title =
+                        (a.getAttribute("title") || "").trim() ||
+                        (a.querySelector("img")?.getAttribute("alt") || "").trim() ||
+                        (a.textContent || "").replace(/\\s+/g, " ").trim();
+
+                    out.push({
+                        feed_id: feedId,
+                        xsec_token: xsecToken,
+                        title,
+                        href: abs,
+                    });
+                }
+                return out;
+            })()
+        """
+
+        for _ in range(scroll_rounds + 1):
+            rows = self._evaluate(extract_js)
+            if isinstance(rows, list):
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    fid = str(row.get("feed_id") or "").strip()
+                    if not fid or fid in seen:
+                        continue
+                    seen.add(fid)
+                    collected.append(
+                        {
+                            "id": fid,
+                            "xsec_token": str(row.get("xsec_token") or "").strip(),
+                            "title": str(row.get("title") or "").strip(),
+                            "url": str(row.get("href") or "").strip(),
+                        }
+                    )
+                    if len(collected) >= limit:
+                        break
+            if len(collected) >= limit:
+                break
+
+            self._evaluate(
+                "window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: 'instant' });"
+            )
+            self._sleep(1.0, minimum_seconds=0.35)
+
+        print(
+            f"[cdp_publish] Home feed scan completed. limit={limit}, "
+            f"scroll_rounds={scroll_rounds}, feeds={len(collected)}"
+        )
+        return {
+            "count": len(collected),
+            "feeds": collected,
+        }
+
     def get_feed_detail(self, feed_id: str, xsec_token: str) -> dict[str, Any]:
         """
         Get feed detail from note page initial state.
@@ -2541,6 +2637,20 @@ def main():
     )
     p_search.add_argument("--location", choices=LOCATION_OPTIONS, help="Location filter")
 
+    # home-feeds - browse home recommended feed cards
+    p_home = sub.add_parser(
+        "home-feeds",
+        aliases=["home_feeds"],
+        help="Scan Xiaohongshu home feed cards (no keyword required)",
+    )
+    p_home.add_argument("--limit", type=int, default=60, help="Max feed cards to return (default: 60)")
+    p_home.add_argument(
+        "--scroll-rounds",
+        type=int,
+        default=6,
+        help="How many scroll rounds to perform (default: 6)",
+    )
+
     # get-feed-detail - get note detail by feed id and token
     p_detail = sub.add_parser(
         "get-feed-detail",
@@ -2778,6 +2888,19 @@ def main():
                 "feeds": feeds,
             }
             print("SEARCH_FEEDS_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("home-feeds", "home_feeds"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.home_feeds(
+                limit=args.limit,
+                scroll_rounds=args.scroll_rounds,
+            )
+            print("HOME_FEEDS_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         elif args.command in ("get-feed-detail", "get_feed_detail"):

@@ -16,7 +16,7 @@ metadata:
 
 优先按以下顺序判断：
 1. 用户明确要求"测试浏览器 / 启动浏览器 / 检查登录 / 只打开不发布"：进入测试浏览器流程。
-2. 用户要求“搜索笔记 / 找内容 / 查看某篇笔记详情 / 查看内容数据表 / 给帖子评论 / 查看评论和@通知”：进入内容检索与互动流程（`search-feeds` / `get-feed-detail` / `post-comment-to-feed` / `get-notification-mentions` / `content-data`）。
+2. 用户要求“搜索笔记 / 找内容 / 首页直刷 / 查看某篇笔记详情 / 查看内容数据表 / 给帖子评论 / 查看评论和@通知”：进入内容检索与互动流程（`search-feeds` / `home-feeds` / `get-feed-detail` / `post-comment-to-feed` / `get-notification-mentions` / `content-data`）。
 3. 用户已提供 `标题 + 正文 + 视频(本地路径或URL)`：直接进入视频发布流程。
 4. 用户已提供 `标题 + 正文 + 图片(本地路径或URL)`：直接进入图文发布流程。
 5. 用户只提供网页 URL：先提取网页内容与图片/视频，再给出可发布草稿，等待用户确认。
@@ -230,11 +230,14 @@ python scripts/cdp_publish.py --port 9223 --account work login
 python scripts/publish_pipeline.py --port 9223 --account work --headless --title-file title.txt --content-file content.txt --image-urls "URL1"
 ```
 
-### 5) 搜索内容 / 获取笔记详情
+### 5) 搜索内容 / 首页直刷 / 获取笔记详情
 
 ```bash
 # 搜索笔记
 python scripts/cdp_publish.py search-feeds --keyword "春招"
+
+# 首页直刷（无关键词，抓推荐流）
+python scripts/cdp_publish.py --reuse-existing-tab home-feeds --limit 60 --scroll-rounds 6
 
 # 可选：带筛选搜索
 python scripts/cdp_publish.py --reuse-existing-tab search-feeds --keyword "春招" --sort-by 最新 --note-type 图文

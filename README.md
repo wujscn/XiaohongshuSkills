@@ -144,12 +144,15 @@ python scripts/cdp_publish.py set-default-account myaccount
 python scripts/cdp_publish.py switch-account
 ```
 
-### 5. 搜索内容、查看笔记详情与评论通知抓取
+### 5. 搜索内容、首页直刷、查看笔记详情与评论通知抓取
 
 ```bash
 # 搜索笔记（可选筛选）
 python scripts/cdp_publish.py search-feeds --keyword "春招"
 python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 --note-type 图文
+
+# 首页直刷（无关键词，抓推荐流）
+python scripts/cdp_publish.py --reuse-existing-tab home-feeds --limit 60 --scroll-rounds 6
 
 # 获取笔记详情（feed_id 与 xsec_token 可从搜索结果中获取）
 python scripts/cdp_publish.py get-feed-detail \
@@ -237,6 +240,9 @@ python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 fill --title "标题"
 # 点击发布按钮
 python scripts/cdp_publish.py click-publish
 
+# 首页直刷（支持下划线别名：home_feeds）
+python scripts/cdp_publish.py home-feeds --limit 60 --scroll-rounds 6
+
 # 搜索笔记（支持下划线别名：search_feeds）
 python scripts/cdp_publish.py search-feeds --keyword "春招"
 python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 --note-type 图文
@@ -263,7 +269,7 @@ python scripts/cdp_publish.py set-default-account NAME
 python scripts/cdp_publish.py switch-account
 ```
 
-说明：`search-feeds`、`get-feed-detail`、`post-comment-to-feed` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
+说明：`home-feeds`、`search-feeds`、`get-feed-detail`、`post-comment-to-feed` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
 说明：登录态检查默认启用本地缓存（12 小时，仅缓存“已登录”结果），到期后自动重新走网页校验。
 说明：`search-feeds` 输出新增 `recommended_keywords_count` 与 `recommended_keywords` 字段，表示输入关键词后回车前的下拉推荐词。
 说明：`content-data` 会校验创作者中心登录态，并抓取 `statistics/data-analysis` 页面中的笔记基础信息表。
