@@ -46,7 +46,7 @@ import csv
 import base64
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from typing import Any
 
 # Add scripts dir to path so sibling modules can be imported in both
@@ -91,6 +91,7 @@ CDP_PORT = 9222
 # Xiaohongshu URLs
 XHS_CREATOR_URL = "https://creator.xiaohongshu.com/publish/publish"
 XHS_HOME_URL = "https://www.xiaohongshu.com"
+XHS_EXPLORE_BASE_URL = "https://www.xiaohongshu.com/explore"
 XHS_NOTIFICATION_URL = "https://www.xiaohongshu.com/notification"
 XHS_CREATOR_LOGIN_CHECK_URL = "https://creator.xiaohongshu.com"
 XHS_HOME_LOGIN_MODAL_KEYWORD = "登录后推荐更懂你的笔记"
@@ -1621,6 +1622,158 @@ class XiaohongshuPublisher:
             "success": True,
         }
 
+    def _click_reply_button_for_anchor(self, anchor_comment_id: str) -> bool:
+        """Try to click reply button for anchored comment in detail page."""
+        anchor_literal = json.dumps(anchor_comment_id, ensure_ascii=False)
+        clicked = self._evaluate(f"""
+            (() => {{
+                const anchorId = {anchor_literal};
+                const isVisible = (node) => {{
+                    if (!(node instanceof HTMLElement)) return false;
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === "none" || style.visibility === "hidden") return false;
+                    const r = node.getBoundingClientRect();
+                    return r.width >= 6 && r.height >= 6;
+                }};
+
+                const getReplyAction = (root) => {{
+                    if (!(root instanceof HTMLElement)) return null;
+                    const selectors = [
+                        "button.reply",
+                        "button[class*='reply']",
+                        "span.reply",
+                        "span[class*='reply']",
+                        "button",
+                        "span",
+                        "a",
+                    ];
+                    for (const sel of selectors) {{
+                        for (const el of root.querySelectorAll(sel)) {{
+                            if (!isVisible(el)) continue;
+                            const txt = (el.textContent || "").replace(/\\s+/g, " " ).trim();
+                            if (txt === "回复" || txt === "Reply") return el;
+                        }}
+                    }}
+                    return null;
+                }};
+
+                const escaped = (typeof CSS !== "undefined" && CSS.escape)
+                    ? CSS.escape(anchorId)
+                    : anchorId.replace(/(["'\\.#:\\[\\]\\(\\)])/g, "\\$1");
+                const directSelectors = [
+                    `[data-comment-id="${{escaped}}"]`,
+                    `[id="${{escaped}}"]`,
+                    `[data-id="${{escaped}}"]`,
+                    `[data-commentid="${{escaped}}"]`,
+                    `[comment-id="${{escaped}}"]`,
+                ];
+
+                for (const sel of directSelectors) {{
+                    const node = document.querySelector(sel);
+                    if (!(node instanceof HTMLElement)) continue;
+                    const root = node.closest(".comment-item, li, .comment, [class*='comment']") || node;
+                    const action = getReplyAction(root) || getReplyAction(node.parentElement || root);
+                    if (action) {{
+                        action.click();
+                        return true;
+                    }}
+                }}
+
+                const roots = [
+                    document.querySelector(".comment-container"),
+                    document.querySelector(".comments-container"),
+                    document.querySelector(".comment-list"),
+                    document.body,
+                ].filter(Boolean);
+                for (const root of roots) {{
+                    const action = getReplyAction(root);
+                    if (action) {{
+                        action.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }})()
+        """)
+        return bool(clicked)
+
+    def reply_to_comment_in_feed(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        anchor_comment_id: str,
+        content: str,
+    ) -> dict[str, Any]:
+        """Reply to a comment in feed detail page via anchor comment id."""
+        clean_feed_id = feed_id.strip()
+        clean_token = xsec_token.strip()
+        clean_anchor = anchor_comment_id.strip()
+        clean_content = content.strip()
+
+        if not clean_feed_id:
+            raise CDPError("feed_id is required.")
+        if not clean_token:
+            raise CDPError("xsec_token is required.")
+        if not clean_anchor:
+            raise CDPError("anchor_comment_id is required.")
+        if not clean_content:
+            raise CDPError("Reply content is empty.")
+
+        detail_url = (
+            f"{XHS_EXPLORE_BASE_URL}/{quote(clean_feed_id)}"
+            f"?xsec_token={quote(clean_token)}"
+            "&xsec_source=pc_feed"
+            f"&anchorCommentId={quote(clean_anchor)}"
+        )
+        print(f"[cdp_publish] Navigating to {detail_url}")
+        self._navigate(detail_url)
+        self._sleep(2.2, minimum_seconds=1.0)
+
+        if not self._click_reply_button_for_anchor(clean_anchor):
+            raise CDPError("reply_button_not_found")
+
+        self._sleep(0.8, minimum_seconds=0.4)
+        filled_len = self._fill_comment_content(clean_content)
+        if filled_len <= 0:
+            raise CDPError("reply_content_empty_after_fill")
+
+        submit_rect_js = """
+            (function() {
+                const isVisible = (node) => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === "none" || style.visibility === "hidden") return false;
+                    const r = node.getBoundingClientRect();
+                    return r.width >= 8 && r.height >= 8;
+                };
+                const buttons = document.querySelectorAll("button");
+                for (const button of buttons) {
+                    if (!(button instanceof HTMLButtonElement)) continue;
+                    if (button.disabled || !isVisible(button)) continue;
+                    const text = (button.textContent || "").replace(/\\s+/g, " " ).trim();
+                    if (text === "发送" || text === "评论" || text === "回复") {
+                        const r = button.getBoundingClientRect();
+                        return { x: r.x, y: r.y, width: r.width, height: r.height };
+                    }
+                }
+                return null;
+            })();
+        """
+        self._click_element_by_cdp("reply submit button", submit_rect_js)
+        self._sleep(1.0, minimum_seconds=0.4)
+
+        print(
+            "[cdp_publish] Reply posted. "
+            f"feed_id={clean_feed_id}, anchor_comment_id={clean_anchor}, length={filled_len}"
+        )
+        return {
+            "feed_id": clean_feed_id,
+            "xsec_token": clean_token,
+            "anchor_comment_id": clean_anchor,
+            "content_length": filled_len,
+            "success": True,
+        }
+
     def _schedule_click_notification_mentions_tab(self) -> str:
         """Schedule a click on mentions tab after evaluate returns."""
         clicked_text = self._evaluate("""
@@ -2672,6 +2825,19 @@ def main():
     p_comment_content.add_argument("--content", help="Comment content")
     p_comment_content.add_argument("--content-file", help="Read comment content from file")
 
+    # reply-to-comment-in-feed - reply in comment/@ thread via anchor comment id
+    p_reply = sub.add_parser(
+        "reply-to-comment-in-feed",
+        aliases=["reply_to_comment_in_feed"],
+        help="Reply to a specific comment in feed detail",
+    )
+    p_reply.add_argument("--feed-id", required=True, help="Feed id")
+    p_reply.add_argument("--xsec-token", required=True, help="xsec token")
+    p_reply.add_argument("--anchor-comment-id", required=True, help="Anchor comment id from mentions")
+    p_reply_content = p_reply.add_mutually_exclusive_group(required=True)
+    p_reply_content.add_argument("--content", help="Reply content")
+    p_reply_content.add_argument("--content-file", help="Read reply content from file")
+
     # get-notification-mentions - capture notification mentions API response
     p_mentions = sub.add_parser(
         "get-notification-mentions",
@@ -2941,6 +3107,29 @@ def main():
                 content=comment_content,
             )
             print("POST_COMMENT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("reply-to-comment-in-feed", "reply_to_comment_in_feed"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            reply_content = args.content
+            if args.content_file:
+                with open(args.content_file, encoding="utf-8") as f:
+                    reply_content = f.read().strip()
+            if not reply_content:
+                print("Error: --content or --content-file required.", file=sys.stderr)
+                sys.exit(1)
+
+            payload = publisher.reply_to_comment_in_feed(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                anchor_comment_id=args.anchor_comment_id,
+                content=reply_content,
+            )
+            print("REPLY_COMMENT_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         elif args.command in ("get-notification-mentions", "get_notification_mentions"):

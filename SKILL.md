@@ -16,7 +16,7 @@ metadata:
 
 优先按以下顺序判断：
 1. 用户明确要求"测试浏览器 / 启动浏览器 / 检查登录 / 只打开不发布"：进入测试浏览器流程。
-2. 用户要求“搜索笔记 / 找内容 / 首页直刷 / 查看某篇笔记详情 / 查看内容数据表 / 给帖子评论 / 查看评论和@通知”：进入内容检索与互动流程（`search-feeds` / `home-feeds` / `get-feed-detail` / `post-comment-to-feed` / `get-notification-mentions` / `content-data`）。
+2. 用户要求“搜索笔记 / 找内容 / 首页直刷 / 查看某篇笔记详情 / 查看内容数据表 / 给帖子评论 / 回复评论 / 查看评论和@通知”：进入内容检索与互动流程（`search-feeds` / `home-feeds` / `get-feed-detail` / `post-comment-to-feed` / `reply-to-comment-in-feed` / `get-notification-mentions` / `content-data`）。
 3. 用户已提供 `标题 + 正文 + 视频(本地路径或URL)`：直接进入视频发布流程。
 4. 用户已提供 `标题 + 正文 + 图片(本地路径或URL)`：直接进入图文发布流程。
 5. 用户只提供网页 URL：先提取网页内容与图片/视频，再给出可发布草稿，等待用户确认。
@@ -60,6 +60,7 @@ metadata:
 3. 若用户需要详情，从搜索结果中取 `id` + `xsecToken` 再执行 `get-feed-detail`。
 4. 若用户需要发表评论，执行 `post-comment-to-feed`（一级评论；必填 `feed_id` / `xsec_token` / `content`）。
 5. 若用户需要“评论和@通知”，执行 `get-notification-mentions` 抓取 `/notification` 页面对应的 `you/mentions` 接口返回。
+6. 若用户需要在评论/@页面回复，先用 `get-notification-mentions` 获取 `item_info.id` / `item_info.xsec_token` / `comment_info.id`，再执行 `reply-to-comment-in-feed` 完成二级回复。
 6. 若用户需要“笔记基础信息表”，执行 `content-data` 获取曝光/观看/点赞等指标。
 7. 回传结构化结果（数量、核心字段、链接）。
 
@@ -285,6 +286,13 @@ python scripts/cdp_publish.py --reuse-existing-tab content-data --csv-file "/abs
 ```bash
 # 抓取 /notification 页面触发的 you/mentions 接口数据
 python scripts/cdp_publish.py get-notification-mentions
+
+# 在评论和@页回复某条评论（二级回复）
+python scripts/cdp_publish.py reply-to-comment-in-feed \
+  --feed-id FEED_ID \
+  --xsec-token XSEC_TOKEN \
+  --anchor-comment-id ANCHOR_COMMENT_ID \
+  --content "收到，感谢补充～"
 
 # 下划线别名
 python scripts/cdp_publish.py get_notification_mentions

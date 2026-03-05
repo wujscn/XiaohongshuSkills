@@ -167,6 +167,13 @@ python scripts/cdp_publish.py post-comment-to-feed \
 
 # 抓取“评论和@”通知接口（you/mentions）
 python scripts/cdp_publish.py get-notification-mentions
+
+# 在评论和@场景里回复某条评论（二级回复）
+python scripts/cdp_publish.py reply-to-comment-in-feed \
+    --feed-id 67abc1234def567890123456 \
+    --xsec-token YOUR_XSEC_TOKEN \
+    --anchor-comment-id 67aaa111bbb222ccc333ddd \
+    --content "收到～感谢补充，我去试试！"
 ```
 
 说明：`search-feeds` 会先在搜索框输入关键词，抓取下拉推荐词（`recommended_keywords`），再回车拉取 feed 列表。
@@ -255,6 +262,13 @@ python scripts/cdp_publish.py post-comment-to-feed --feed-id FEED_ID --xsec-toke
 
 # 抓取通知评论接口（支持下划线别名：get_notification_mentions）
 python scripts/cdp_publish.py get-notification-mentions
+
+# 在评论和@场景回复某条评论（支持下划线别名：reply_to_comment_in_feed）
+python scripts/cdp_publish.py reply-to-comment-in-feed \
+  --feed-id FEED_ID \
+  --xsec-token XSEC_TOKEN \
+  --anchor-comment-id ANCHOR_COMMENT_ID \
+  --content "回复内容"
 
 # 获取内容数据表（支持下划线别名：content_data）
 python scripts/cdp_publish.py content-data
