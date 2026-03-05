@@ -1054,10 +1054,11 @@ class XiaohongshuPublisher:
         xsec_token = xsec_token.strip()
         if not feed_id:
             raise CDPError("feed_id cannot be empty.")
-        if not xsec_token:
-            raise CDPError("xsec_token cannot be empty.")
 
-        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        if xsec_token:
+            detail_url = make_feed_detail_url(feed_id, xsec_token)
+        else:
+            detail_url = f"https://www.xiaohongshu.com/explore/{feed_id}"
         self._navigate(detail_url)
         self._sleep(2, minimum_seconds=1.0)
 
@@ -1125,25 +1126,89 @@ class XiaohongshuPublisher:
         result = self._evaluate(f"""
             (() => {{
                 const commentText = {content_literal};
+                const isVisible = (node) => {{
+                    if (!(node instanceof HTMLElement)) {{
+                        return false;
+                    }}
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === "none" || style.visibility === "hidden") {{
+                        return false;
+                    }}
+                    const rect = node.getBoundingClientRect();
+                    return rect.width >= 6 && rect.height >= 6;
+                }};
+                const isSearchInputNode = (node) => {{
+                    if (!(node instanceof HTMLElement)) {{
+                        return false;
+                    }}
+                    if (node.matches("#search-input, .search-input, input[placeholder*='搜索']")) {{
+                        return true;
+                    }}
+                    if (node.closest("header, .search-container, .search-box, .search-input")) {{
+                        const searchInput = node.closest("header, .search-container, .search-box, .search-input")
+                            ?.querySelector?.("#search-input, .search-input, input[placeholder*='搜索']");
+                        if (searchInput) {{
+                            return true;
+                        }}
+                    }}
+                    const inputBox = node.closest(".input-box");
+                    if (inputBox && inputBox.querySelector("#search-input, .search-input, input[placeholder*='搜索']")) {{
+                        return true;
+                    }}
+                    return false;
+                }};
+                const inCommentContext = (node) => {{
+                    if (!(node instanceof HTMLElement)) {{
+                        return false;
+                    }}
+                    if (isSearchInputNode(node)) {{
+                        return false;
+                    }}
+                    if (node.matches("textarea[placeholder*='说点什么'], textarea[placeholder*='写评论'], [placeholder*='说点什么'], [placeholder*='写评论']")) {{
+                        return true;
+                    }}
+                    if (node.isContentEditable || node.getAttribute("role") === "textbox") {{
+                        return true;
+                    }}
+                    let cur = node;
+                    for (let i = 0; i < 7 && cur; i += 1) {{
+                        const cls = String(cur.className || "").toLowerCase();
+                        const id = String(cur.id || "").toLowerCase();
+                        if (cls.includes("comment") || cls.includes("input") || id.includes("comment")) {{
+                            return true;
+                        }}
+                        cur = cur.parentElement;
+                    }}
+                    return false;
+                }};
                 const candidates = [
-                    "div.input-box div.content-edit p.content-input",
                     "div.input-box div.content-edit [contenteditable='true']",
-                    "div.input-box .content-input",
-                    "p.content-input",
-                    "[class*='content-edit'] [contenteditable='true']",
+                    "div.input-box div.content-edit p.content-input",
+                    "div.input-box [role='textbox']",
+                    "div.comment-container [contenteditable='true']",
+                    "div.comment-input-container [contenteditable='true']",
+                    "div[class*='comment-input'] [contenteditable='true']",
+                    "div[class*='comment'] [contenteditable='true']",
+                    "div[role='textbox']",
+                    "textarea[placeholder*='说点什么']",
+                    "textarea[placeholder*='写评论']",
+                    "[placeholder*='说点什么']",
+                    "[placeholder*='写评论']",
                 ];
 
                 let inputEl = null;
                 for (const selector of candidates) {{
-                    const node = document.querySelector(selector);
-                    if (!(node instanceof HTMLElement)) {{
-                        continue;
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {{
+                        if (!isVisible(node) || !inCommentContext(node)) {{
+                            continue;
+                        }}
+                        inputEl = node;
+                        break;
                     }}
-                    if (node.offsetParent === null) {{
-                        continue;
+                    if (inputEl) {{
+                        break;
                     }}
-                    inputEl = node;
-                    break;
                 }}
 
                 if (!inputEl) {{
@@ -1223,34 +1288,86 @@ class XiaohongshuPublisher:
 
         if not feed_id:
             raise CDPError("feed_id cannot be empty.")
-        if not xsec_token:
-            raise CDPError("xsec_token cannot be empty.")
         if not content:
             raise CDPError("content cannot be empty.")
 
-        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        if xsec_token:
+            detail_url = make_feed_detail_url(feed_id, xsec_token)
+        else:
+            detail_url = f"https://www.xiaohongshu.com/explore/{feed_id}"
         self._navigate(detail_url)
         self._sleep(2, minimum_seconds=1.0)
         self._check_feed_page_accessible()
 
         input_rect_js = """
             (function() {
+                const isVisible = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return false;
+                    }
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === "none" || style.visibility === "hidden") {
+                        return false;
+                    }
+                    const r = node.getBoundingClientRect();
+                    return r.width >= 8 && r.height >= 8;
+                };
+                const isSearchInputNode = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return false;
+                    }
+                    if (node.matches("#search-input, .search-input, input[placeholder*='搜索']")) {
+                        return true;
+                    }
+                    if (node.closest("header, .search-container, .search-box, .search-input")) {
+                        const searchInput = node.closest("header, .search-container, .search-box, .search-input")
+                            ?.querySelector?.("#search-input, .search-input, input[placeholder*='搜索']");
+                        if (searchInput) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                const inCommentContext = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return false;
+                    }
+                    if (isSearchInputNode(node)) {
+                        return false;
+                    }
+                    let cur = node;
+                    for (let i = 0; i < 7 && cur; i += 1) {
+                        const cls = String(cur.className || "").toLowerCase();
+                        const id = String(cur.id || "").toLowerCase();
+                        if (cls.includes("comment") || cls.includes("content-edit") || cls.includes("input") || id.includes("comment")) {
+                            return true;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    return false;
+                };
                 const selectors = [
+                    "div.input-box div.content-edit [contenteditable='true']",
+                    "div.input-box [role='textbox']",
                     "div.input-box div.content-edit span",
                     "div.input-box div.content-edit p.content-input",
                     "div.input-box div.content-edit",
-                    "div.input-box",
+                    "div[class*='comment-input'] [contenteditable='true']",
+                    "div[class*='comment'] [contenteditable='true']",
+                    "textarea[placeholder*='说点什么']",
+                    "textarea[placeholder*='写评论']",
+                    "[placeholder*='说点什么']",
+                    "[placeholder*='写评论']",
                 ];
                 for (const selector of selectors) {
-                    const el = document.querySelector(selector);
-                    if (!(el instanceof HTMLElement) || el.offsetParent === null) {
-                        continue;
+                    const nodes = document.querySelectorAll(selector);
+                    for (const el of nodes) {
+                        if (!isVisible(el) || !inCommentContext(el)) {
+                            continue;
+                        }
+                        const r = el.getBoundingClientRect();
+                        return { x: r.x, y: r.y, width: r.width, height: r.height };
                     }
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 8 || r.height < 8) {
-                        continue;
-                    }
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
                 }
                 return null;
             })();
@@ -1269,6 +1386,51 @@ class XiaohongshuPublisher:
 
         submit_rect_js = """
             (function() {
+                const isVisible = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return false;
+                    }
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === "none" || style.visibility === "hidden") {
+                        return false;
+                    }
+                    const r = node.getBoundingClientRect();
+                    return r.width >= 8 && r.height >= 8;
+                };
+                const isSearchInputNode = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return false;
+                    }
+                    if (node.matches("#search-input, .search-input, input[placeholder*='搜索']")) {
+                        return true;
+                    }
+                    if (node.closest("header, .search-container, .search-box, .search-input")) {
+                        const searchInput = node.closest("header, .search-container, .search-box, .search-input")
+                            ?.querySelector?.("#search-input, .search-input, input[placeholder*='搜索']");
+                        if (searchInput) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                const inCommentContext = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return false;
+                    }
+                    if (isSearchInputNode(node)) {
+                        return false;
+                    }
+                    let cur = node;
+                    for (let i = 0; i < 8 && cur; i += 1) {
+                        const cls = String(cur.className || "").toLowerCase();
+                        const id = String(cur.id || "").toLowerCase();
+                        if (cls.includes("comment") || cls.includes("input") || cls.includes("reply") || id.includes("comment")) {
+                            return true;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    return false;
+                };
                 const selectors = [
                     "div.bottom button.submit",
                     "div.bottom button[class*='submit']",
@@ -1277,26 +1439,25 @@ class XiaohongshuPublisher:
                     "button[type='submit']",
                 ];
                 for (const selector of selectors) {
-                    const el = document.querySelector(selector);
-                    if (!(el instanceof HTMLButtonElement) || el.offsetParent === null) {
-                        continue;
+                    const nodes = document.querySelectorAll(selector);
+                    for (const el of nodes) {
+                        if (!(el instanceof HTMLButtonElement)) {
+                            continue;
+                        }
+                        if (el.disabled || !isVisible(el) || !inCommentContext(el)) {
+                            continue;
+                        }
+                        const r = el.getBoundingClientRect();
+                        return { x: r.x, y: r.y, width: r.width, height: r.height };
                     }
-                    if (el.disabled) {
-                        continue;
-                    }
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 8 || r.height < 8) {
-                        continue;
-                    }
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
                 }
                 const fallbackTexts = new Set(["发送", "提交", "评论"]);
                 const buttons = document.querySelectorAll("button");
                 for (const button of buttons) {
-                    if (!(button instanceof HTMLButtonElement) || button.offsetParent === null) {
+                    if (!(button instanceof HTMLButtonElement)) {
                         continue;
                     }
-                    if (button.disabled) {
+                    if (button.disabled || !isVisible(button) || !inCommentContext(button)) {
                         continue;
                     }
                     const text = (button.textContent || "").replace(/\\s+/g, " ").trim();
@@ -1304,15 +1465,56 @@ class XiaohongshuPublisher:
                         continue;
                     }
                     const r = button.getBoundingClientRect();
-                    if (r.width < 8 || r.height < 8) {
-                        continue;
-                    }
                     return { x: r.x, y: r.y, width: r.width, height: r.height };
                 }
                 return null;
             })();
         """
-        self._click_element_by_cdp("comment submit button", submit_rect_js)
+        try:
+            self._click_element_by_cdp("comment submit button", submit_rect_js)
+        except CDPError:
+            clicked = self._evaluate("""
+                (() => {
+                    const input = document.querySelector("#content-textarea")
+                        || document.querySelector("div.input-box .content-edit p.content-input");
+                    const root = input
+                        ? (input.closest(".engage-bar")
+                            || input.closest(".engage-bar-container")
+                            || input.closest(".interaction-container")
+                            || document.body)
+                        : document.body;
+                    const isVisible = (node) => {
+                        if (!(node instanceof HTMLElement)) {
+                            return false;
+                        }
+                        const style = window.getComputedStyle(node);
+                        if (!style || style.display === "none" || style.visibility === "hidden") {
+                            return false;
+                        }
+                        const r = node.getBoundingClientRect();
+                        return r.width >= 8 && r.height >= 8;
+                    };
+
+                    const buttons = root.querySelectorAll("button");
+                    for (const button of buttons) {
+                        if (!(button instanceof HTMLButtonElement)) {
+                            continue;
+                        }
+                        if (!isVisible(button) || button.disabled) {
+                            continue;
+                        }
+                        const text = (button.textContent || "").replace(/\\s+/g, " ").trim();
+                        if (text !== "发送") {
+                            continue;
+                        }
+                        button.click();
+                        return true;
+                    }
+                    return false;
+                })()
+            """)
+            if not clicked:
+                raise
         self._sleep(1.0, minimum_seconds=0.4)
 
         print(f"[cdp_publish] Comment posted. feed_id={feed_id}, length={filled_len}")
