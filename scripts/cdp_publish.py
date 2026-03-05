@@ -1796,14 +1796,35 @@ class XiaohongshuPublisher:
         if not clicked_tab:
             raise CDPError("notification_tab_not_found")
 
+        # attach marker for delivery verification
+        verify_marker = f"__xhsv{int(time.time())}"
+        verify_content = f"{clean_content} {verify_marker}".strip()
         direct_payload = self._reply_directly_in_notification(
             target_comment_content=clean_target_comment,
-            reply_content=clean_content,
+            reply_content=verify_content,
         )
+
+        # Verify marker appears in feed detail payload; otherwise treat as not-delivered.
+        marker_found = False
+        for _ in range(3):
+            try:
+                detail = self.get_feed_detail(clean_feed_id, clean_token)
+                detail_raw = json.dumps(detail, ensure_ascii=False)
+                if verify_marker in detail_raw:
+                    marker_found = True
+                    break
+            except Exception:
+                pass
+            self._sleep(0.6, minimum_seconds=0.3)
+
+        if not marker_found:
+            raise CDPError("notification_reply_not_delivered")
+
         direct_payload.update({
             "feed_id": clean_feed_id,
             "xsec_token": clean_token,
             "anchor_comment_id": clean_anchor,
+            "delivery_verified": True,
         })
         return direct_payload
 
@@ -2058,15 +2079,22 @@ class XiaohongshuPublisher:
         target_comment_content: str,
         reply_content: str,
     ) -> dict[str, Any]:
-        """In notification page: click target card's 回复, fill textarea.comment-input, then send."""
+        """In notification page: reply inside exact target card scope only."""
         target = (target_comment_content or "").strip()
+        content = (reply_content or "").strip()
         if not target:
             raise CDPError("target_comment_content is required for notification direct reply")
+        if not content:
+            raise CDPError("reply_content is required")
 
         target_literal = json.dumps(target, ensure_ascii=False)
-        click_result = self._evaluate(f"""
+        content_literal = json.dumps(content, ensure_ascii=False)
+
+        result = self._evaluate(f"""
             (() => {{
                 const target = {target_literal};
+                const content = {content_literal};
+
                 const isVisible = (n) => {{
                     if (!(n instanceof HTMLElement)) return false;
                     const s = getComputedStyle(n);
@@ -2074,75 +2102,117 @@ class XiaohongshuPublisher:
                     const r = n.getBoundingClientRect();
                     return r.width >= 6 && r.height >= 6;
                 }};
+                const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
+
                 const cards = [...document.querySelectorAll('div.container')].filter(isVisible);
+                let card = null;
                 for (const c of cards) {{
-                    const t = (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim();
-                    if (!t || !t.includes(target)) continue;
-                    const reply = c.querySelector('.action-reply');
-                    if (!(reply instanceof HTMLElement) || !isVisible(reply)) continue;
-                    reply.click();
-                    return {{ ok: true, card_preview: t.slice(0, 160) }};
+                    const t = norm(c.innerText || c.textContent || '');
+                    if (!t) continue;
+                    if (t.includes(target)) {{
+                        card = c;
+                        break;
+                    }}
                 }}
-                return {{ ok: false, reason: 'notification_target_card_not_found' }};
+                if (!card) {{
+                    return {{ ok: false, reason: 'notification_target_card_not_found' }};
+                }}
+
+                const replyBtn = card.querySelector('.action-reply');
+                if (!(replyBtn instanceof HTMLElement) || !isVisible(replyBtn)) {{
+                    return {{ ok: false, reason: 'notification_reply_btn_not_found' }};
+                }}
+
+                // Some notification layouts only show inline input after card focus.
+                card.click();
+                replyBtn.click();
+
+                // Composer may be lazy-mounted; wait briefly for send action first.
+                for (let i = 0; i < 16; i += 1) {{
+                    const sendProbe = card.querySelector('.action-send');
+                    if (sendProbe instanceof HTMLElement && isVisible(sendProbe)) break;
+                    const start = Date.now();
+                    while (Date.now() - start < 120) {{}}
+                }}
+
+                let input = null;
+                const scopes = [card, card.parentElement, card.parentElement?.parentElement].filter(Boolean);
+                for (let i = 0; i < 24; i += 1) {{
+                    for (const scope of scopes) {{
+                        input = scope.querySelector('textarea.comment-input, textarea[placeholder*="回复"], textarea[placeholder*="评论"], textarea[placeholder*="说点什么"]');
+                        if (input instanceof HTMLTextAreaElement && isVisible(input)) break;
+                        input = scope.querySelector('[contenteditable="true"]');
+                        if (input instanceof HTMLElement && isVisible(input)) break;
+                        input = null;
+                    }}
+                    if (input) break;
+                    const start = Date.now();
+                    while (Date.now() - start < 120) {{}}
+                }}
+
+                let filled = false;
+                if (input instanceof HTMLTextAreaElement) {{
+                    input.focus();
+                    input.value = content;
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    filled = true;
+                }} else if (input instanceof HTMLElement) {{
+                    input.focus();
+                    input.textContent = content;
+                    input.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: content, inputType: 'insertText' }}));
+                    filled = true;
+                }}
+
+                let sendEl = null;
+                const sendScopes = [card, card.parentElement, card.parentElement?.parentElement].filter(Boolean);
+                for (const scope of sendScopes) {{
+                    sendEl = scope.querySelector('.action-send');
+                    if (sendEl instanceof HTMLElement && isVisible(sendEl)) break;
+                    sendEl = null;
+                    const candidates = scope.querySelectorAll('button, span, a, div[role="button"]');
+                    for (const el of candidates) {{
+                        if (!(el instanceof HTMLElement) || !isVisible(el)) continue;
+                        const t = norm(el.textContent || '');
+                        if (t === '发送' || t === '回复' || t === '评论') {{
+                            sendEl = el;
+                            break;
+                        }}
+                    }}
+                    if (sendEl) break;
+                }}
+
+                if (filled && (sendEl instanceof HTMLElement)) {{
+                    sendEl.click();
+                }} else {{
+                    // Keyboard fallback: focus reply area and dispatch Enter.
+                    const focusTarget = (input instanceof HTMLElement) ? input : card;
+                    focusTarget.focus();
+                    const evDown = new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', bubbles: true }});
+                    const evUp = new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', bubbles: true }});
+                    focusTarget.dispatchEvent(evDown);
+                    focusTarget.dispatchEvent(evUp);
+                }}
+                return {{
+                    ok: true,
+                    reason: 'ok',
+                    card_preview: norm(card.innerText || card.textContent || '').slice(0, 180),
+                    used_scope: 'card',
+                }};
             }})()
         """)
-        if not isinstance(click_result, dict) or not click_result.get("ok"):
-            reason = click_result.get("reason") if isinstance(click_result, dict) else "notification_click_unknown"
-            raise CDPError(f"notification_reply_click_failed: {reason}")
 
-        # Wait for inline textarea to appear
-        ready = False
-        deadline = time.time() + 6.0
-        while time.time() < deadline:
-            has_input = self._evaluate("""
-                (() => {
-                    const el = document.querySelector('textarea.comment-input, textarea[placeholder*="回复"]');
-                    if (!(el instanceof HTMLTextAreaElement)) return false;
-                    const r = el.getBoundingClientRect();
-                    return r.width >= 8 && r.height >= 8;
-                })()
-            """)
-            if has_input:
-                ready = True
-                break
-            self._sleep(0.25, minimum_seconds=0.15)
-        if not ready:
-            raise CDPError("notification_reply_input_not_found")
-
-        filled_len = self._fill_comment_content(reply_content)
-        if filled_len <= 0:
-            raise CDPError("notification_reply_content_empty_after_fill")
-
-        submit_rect_js = """
-            (function() {
-                const isVisible = (node) => {
-                    if (!(node instanceof HTMLElement)) return false;
-                    const style = window.getComputedStyle(node);
-                    if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
-                    const r = node.getBoundingClientRect();
-                    return r.width >= 8 && r.height >= 8;
-                };
-                const nodes = document.querySelectorAll('button, .action-send, span, div[role="button"]');
-                for (const node of nodes) {
-                    if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
-                    const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
-                    if (text === '发送' || text === '回复' || text === '评论') {
-                        const r = node.getBoundingClientRect();
-                        return { x: r.x, y: r.y, width: r.width, height: r.height };
-                    }
-                }
-                return null;
-            })();
-        """
-        self._click_element_by_cdp("notification reply submit", submit_rect_js)
-        self._sleep(0.8, minimum_seconds=0.4)
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = result.get("reason") if isinstance(result, dict) else "notification_reply_unknown"
+            raise CDPError(f"notification_reply_failed: {reason}")
 
         return {
             "success": True,
             "mode": "notification_direct_reply",
             "target_comment_content": target,
-            "content_length": filled_len,
-            "card_preview": click_result.get("card_preview", ""),
+            "content_length": len(content),
+            "card_preview": result.get("card_preview", ""),
+            "used_scope": result.get("used_scope", "unknown"),
         }
 
     def get_notification_mentions(self, wait_seconds: float = 18.0) -> dict[str, Any]:
