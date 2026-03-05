@@ -2226,10 +2226,26 @@ class XiaohongshuPublisher:
                 "Please open notification page manually and retry."
             )
 
-        body_result = self._send("Network.getResponseBody", {"requestId": target_request_id})
-        body_text = body_result.get("body", "")
-        if body_result.get("base64Encoded"):
-            body_text = base64.b64decode(body_text).decode("utf-8", errors="replace")
+        body_text = ""
+        last_body_err: Exception | None = None
+        for _ in range(3):
+            try:
+                body_result = self._send("Network.getResponseBody", {"requestId": target_request_id})
+                body_text = body_result.get("body", "")
+                if body_result.get("base64Encoded"):
+                    body_text = base64.b64decode(body_text).decode("utf-8", errors="replace")
+                if body_text:
+                    break
+            except CDPError as e:
+                # Intermittent Chrome CDP issue: no data found for resource identifier.
+                last_body_err = e
+                self._sleep(0.2, minimum_seconds=0.1)
+                continue
+
+        if not body_text:
+            if last_body_err:
+                raise last_body_err
+            raise CDPError("Notification mentions response body is empty.")
 
         try:
             payload = json.loads(body_text)
