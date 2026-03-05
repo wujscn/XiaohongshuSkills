@@ -1286,11 +1286,20 @@ class XiaohongshuPublisher:
                     "div.comment-input-container [contenteditable='true']",
                     "div[class*='comment-input'] [contenteditable='true']",
                     "div[class*='comment'] [contenteditable='true']",
+                    "div[class*='reply'] [contenteditable='true']",
+                    "div[class*='message'] [contenteditable='true']",
+                    "div[class*='interaction'] [contenteditable='true']",
+                    "div[class*='drawer'] [contenteditable='true']",
+                    "div[class*='modal'] [contenteditable='true']",
                     "div[role='textbox']",
                     "textarea[placeholder*='说点什么']",
                     "textarea[placeholder*='写评论']",
+                    "textarea.comment-input",
+                    "textarea.comment-input",
+                    "textarea[placeholder*='回复']",
                     "[placeholder*='说点什么']",
                     "[placeholder*='写评论']",
+                    "[placeholder*='回复']",
                 ];
 
                 let inputEl = null;
@@ -1451,10 +1460,17 @@ class XiaohongshuPublisher:
                     "div.input-box div.content-edit",
                     "div[class*='comment-input'] [contenteditable='true']",
                     "div[class*='comment'] [contenteditable='true']",
+                    "div[class*='reply'] [contenteditable='true']",
+                    "div[class*='message'] [contenteditable='true']",
+                    "div[class*='interaction'] [contenteditable='true']",
+                    "div[class*='drawer'] [contenteditable='true']",
+                    "div[class*='modal'] [contenteditable='true']",
                     "textarea[placeholder*='说点什么']",
                     "textarea[placeholder*='写评论']",
+                    "textarea[placeholder*='回复']",
                     "[placeholder*='说点什么']",
                     "[placeholder*='写评论']",
+                    "[placeholder*='回复']",
                 ];
                 for (const selector of selectors) {
                     const nodes = document.querySelectorAll(selector);
@@ -1622,12 +1638,19 @@ class XiaohongshuPublisher:
             "success": True,
         }
 
-    def _click_reply_button_for_anchor(self, anchor_comment_id: str) -> bool:
-        """Try to click reply button for anchored comment in detail page."""
+    def _focus_reply_target_for_anchor(
+        self,
+        anchor_comment_id: str,
+        target_comment_content: str = "",
+    ) -> dict[str, Any]:
+        """Focus reply action for exact target; never fallback to arbitrary comments."""
         anchor_literal = json.dumps(anchor_comment_id, ensure_ascii=False)
-        clicked = self._evaluate(f"""
+        target_comment_literal = json.dumps(target_comment_content or "", ensure_ascii=False)
+        result = self._evaluate(f"""
             (() => {{
                 const anchorId = {anchor_literal};
+                const targetCommentText = {target_comment_literal};
+
                 const isVisible = (node) => {{
                     if (!(node instanceof HTMLElement)) return false;
                     const style = window.getComputedStyle(node);
@@ -1636,21 +1659,33 @@ class XiaohongshuPublisher:
                     return r.width >= 6 && r.height >= 6;
                 }};
 
-                const getReplyAction = (root) => {{
+                const getText = (node) => (node && (node.innerText || node.textContent || ""))
+                    .replace(/\s+/g, " ")
+                    .trim();
+
+                const clickExpandReplies = () => {{
+                    const nodes = document.querySelectorAll('button, span, a, div[role="button"]');
+                    let clicked = 0;
+                    for (const el of nodes) {{
+                        if (!(el instanceof HTMLElement) || !isVisible(el)) continue;
+                        const txt = getText(el);
+                        if (!txt || txt.length > 30) continue;
+                        if (/^(展开|查看|更多).{0,8}回复$/.test(txt)
+                            || /^共\d+条回复$/.test(txt)
+                            || /^回复\(\d+\)$/.test(txt)) {{
+                            try {{ el.click(); clicked += 1; }} catch (e) {{}}
+                        }}
+                    }}
+                    return clicked;
+                }};
+
+                const findReplyAction = (root) => {{
                     if (!(root instanceof HTMLElement)) return null;
-                    const selectors = [
-                        "button.reply",
-                        "button[class*='reply']",
-                        "span.reply",
-                        "span[class*='reply']",
-                        "button",
-                        "span",
-                        "a",
-                    ];
+                    const selectors = ["button", "span", "a", "[role='button']"];
                     for (const sel of selectors) {{
                         for (const el of root.querySelectorAll(sel)) {{
-                            if (!isVisible(el)) continue;
-                            const txt = (el.textContent || "").replace(/\\s+/g, " " ).trim();
+                            if (!(el instanceof HTMLElement) || !isVisible(el)) continue;
+                            const txt = getText(el);
                             if (txt === "回复" || txt === "Reply") return el;
                         }}
                     }}
@@ -1659,8 +1694,11 @@ class XiaohongshuPublisher:
 
                 const escaped = (typeof CSS !== "undefined" && CSS.escape)
                     ? CSS.escape(anchorId)
-                    : anchorId.replace(/(["'\\.#:\\[\\]\\(\\)])/g, "\\$1");
-                const directSelectors = [
+                    : anchorId.replace(/(["'\\.#:\[\]\(\)])/g, "\\$1");
+
+                const selectorCandidates = [
+                    `#comment-${{escaped}}`,
+                    `[id="comment-${{escaped}}"]`,
                     `[data-comment-id="${{escaped}}"]`,
                     `[id="${{escaped}}"]`,
                     `[data-id="${{escaped}}"]`,
@@ -1668,34 +1706,61 @@ class XiaohongshuPublisher:
                     `[comment-id="${{escaped}}"]`,
                 ];
 
-                for (const sel of directSelectors) {{
-                    const node = document.querySelector(sel);
-                    if (!(node instanceof HTMLElement)) continue;
-                    const root = node.closest(".comment-item, li, .comment, [class*='comment']") || node;
-                    const action = getReplyAction(root) || getReplyAction(node.parentElement || root);
-                    if (action) {{
-                        action.click();
-                        return true;
+                const findTargetNodeByAnchor = () => {{
+                    for (const sel of selectorCandidates) {{
+                        const node = document.querySelector(sel);
+                        if (node instanceof HTMLElement) return node;
                     }}
+                    return null;
+                }};
+
+                const findTargetNodeByContent = () => {{
+                    const needle = (targetCommentText || "").replace(/\s+/g, " ").trim();
+                    if (!needle) return null;
+                    const nodes = document.querySelectorAll('.comment-item, li, .comment, [class*="comment"], p, span, div');
+                    for (const node of nodes) {{
+                        if (!(node instanceof HTMLElement)) continue;
+                        const txt = getText(node);
+                        if (!txt) continue;
+                        if (txt.includes(needle)) return node;
+                    }}
+                    return null;
+                }};
+
+                let targetNode = findTargetNodeByAnchor();
+                if (!targetNode) {{
+                    const expanded = clickExpandReplies();
+                    if (expanded > 0) {{
+                        targetNode = findTargetNodeByAnchor();
+                    }}
+                }}
+                if (!targetNode) {{
+                    targetNode = findTargetNodeByContent();
+                }}
+                if (!targetNode) {{
+                    return {{ ok: false, reason: "anchor_and_content_not_found" }};
                 }}
 
-                const roots = [
-                    document.querySelector(".comment-container"),
-                    document.querySelector(".comments-container"),
-                    document.querySelector(".comment-list"),
-                    document.body,
-                ].filter(Boolean);
-                for (const root of roots) {{
-                    const action = getReplyAction(root);
-                    if (action) {{
-                        action.click();
-                        return true;
-                    }}
+                const root = targetNode.closest('.comment-item, li, .comment, [class*="comment"], article, section') || targetNode;
+                const parentComment = root.closest('.comment-item')?.parentElement?.closest?.('.comment-item') || null;
+                const action =
+                    findReplyAction(root)
+                    || findReplyAction(targetNode.parentElement || root)
+                    || (parentComment ? findReplyAction(parentComment) : null)
+                    || (root.parentElement ? findReplyAction(root.parentElement) : null);
+
+                if (!action) {{
+                    return {{ ok: false, reason: "reply_action_not_found" }};
                 }}
-                return false;
+
+                const targetText = getText(root).slice(0, 160);
+                action.click();
+                return {{ ok: true, reason: "ok", target_preview: targetText }};
             }})()
         """)
-        return bool(clicked)
+        if isinstance(result, dict):
+            return result
+        return {"ok": False, "reason": "unexpected_eval_result"}
 
     def reply_to_comment_in_feed(
         self,
@@ -1703,12 +1768,14 @@ class XiaohongshuPublisher:
         xsec_token: str,
         anchor_comment_id: str,
         content: str,
+        target_comment_content: str = "",
     ) -> dict[str, Any]:
         """Reply to a comment in feed detail page via anchor comment id."""
         clean_feed_id = feed_id.strip()
         clean_token = xsec_token.strip()
         clean_anchor = anchor_comment_id.strip()
         clean_content = content.strip()
+        clean_target_comment = (target_comment_content or "").strip()
 
         if not clean_feed_id:
             raise CDPError("feed_id is required.")
@@ -1719,18 +1786,47 @@ class XiaohongshuPublisher:
         if not clean_content:
             raise CDPError("Reply content is empty.")
 
+        if clean_target_comment:
+            # Preferred path for mentions: reply directly in /notification card to avoid wrong-thread replies.
+            self._navigate(XHS_NOTIFICATION_URL)
+            self._sleep(1.0, minimum_seconds=0.5)
+            clicked_tab = self._schedule_click_notification_mentions_tab()
+            if clicked_tab:
+                try:
+                    direct_payload = self._reply_directly_in_notification(
+                        target_comment_content=clean_target_comment,
+                        reply_content=clean_content,
+                    )
+                    direct_payload.update({
+                        "feed_id": clean_feed_id,
+                        "xsec_token": clean_token,
+                        "anchor_comment_id": clean_anchor,
+                    })
+                    return direct_payload
+                except CDPError:
+                    pass
+
         detail_url = (
             f"{XHS_EXPLORE_BASE_URL}/{quote(clean_feed_id)}"
             f"?xsec_token={quote(clean_token)}"
             "&xsec_source=pc_feed"
             f"&anchorCommentId={quote(clean_anchor)}"
         )
-        print(f"[cdp_publish] Navigating to {detail_url}")
-        self._navigate(detail_url)
-        self._sleep(2.2, minimum_seconds=1.0)
+        print(f"[cdp_publish] Opening notification context for anchor {clean_anchor}")
+        try:
+            opened = self.open_notification_item_context(clean_anchor, timeout_seconds=12.0)
+            print(f"[cdp_publish] Opened from notification: {opened.get('url')}")
+        except CDPError:
+            print(f"[cdp_publish] Fallback navigate to {detail_url}")
+            self._navigate(detail_url)
+            self._sleep(2.2, minimum_seconds=1.0)
 
-        if not self._click_reply_button_for_anchor(clean_anchor):
-            raise CDPError("reply_button_not_found")
+        focus_result = self._focus_reply_target_for_anchor(
+            clean_anchor,
+            target_comment_content=clean_target_comment,
+        )
+        if not focus_result.get("ok"):
+            raise CDPError(f"reply_target_not_found: {focus_result.get('reason')}")
 
         self._sleep(0.8, minimum_seconds=0.4)
         filled_len = self._fill_comment_content(clean_content)
@@ -1746,11 +1842,12 @@ class XiaohongshuPublisher:
                     const r = node.getBoundingClientRect();
                     return r.width >= 8 && r.height >= 8;
                 };
-                const buttons = document.querySelectorAll("button");
+                const buttons = document.querySelectorAll("button, .action-send, span, div[role='button']");
                 for (const button of buttons) {
-                    if (!(button instanceof HTMLButtonElement)) continue;
-                    if (button.disabled || !isVisible(button)) continue;
-                    const text = (button.textContent || "").replace(/\\s+/g, " " ).trim();
+                    if (!(button instanceof HTMLElement)) continue;
+                    if (!isVisible(button)) continue;
+                    if ((button instanceof HTMLButtonElement) && button.disabled) continue;
+                    const text = (button.textContent || "").replace(/\s+/g, " " ).trim();
                     if (text === "发送" || text === "评论" || text === "回复") {
                         const r = button.getBoundingClientRect();
                         return { x: r.x, y: r.y, width: r.width, height: r.height };
@@ -1770,6 +1867,7 @@ class XiaohongshuPublisher:
             "feed_id": clean_feed_id,
             "xsec_token": clean_token,
             "anchor_comment_id": clean_anchor,
+            "target_preview": focus_result.get("target_preview", ""),
             "content_length": filled_len,
             "success": True,
         }
@@ -1910,6 +2008,167 @@ class XiaohongshuPublisher:
             "items": items,
             "raw_payload": payload,
             "capture_mode": "page_fetch",
+        }
+
+    def open_notification_item_context(self, anchor_comment_id: str, timeout_seconds: float = 10.0) -> dict[str, Any]:
+        """Open /notification and click the specific mention item by comment_info.id."""
+        clean_anchor = (anchor_comment_id or "").strip()
+        if not clean_anchor:
+            raise CDPError("anchor_comment_id is required")
+
+        self._navigate(XHS_NOTIFICATION_URL)
+        self._sleep(1.2, minimum_seconds=0.5)
+
+        clicked_tab = self._schedule_click_notification_mentions_tab()
+        if not clicked_tab:
+            raise CDPError("notification_tab_not_found")
+        self._sleep(0.8, minimum_seconds=0.4)
+
+        anchor_literal = json.dumps(clean_anchor, ensure_ascii=False)
+        clicked = self._evaluate(f"""
+            (() => {{
+                const anchor = {anchor_literal};
+                const isVisible = (node) => {{
+                    if (!(node instanceof HTMLElement)) return false;
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+                    const r = node.getBoundingClientRect();
+                    return r.width >= 8 && r.height >= 8;
+                }};
+
+                const nodes = document.querySelectorAll('a, div, li, section, article');
+                for (const node of nodes) {{
+                    if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+                    const attrs = [
+                        node.getAttribute('href') || '',
+                        node.getAttribute('data-href') || '',
+                        node.getAttribute('data-url') || '',
+                        node.id || '',
+                    ];
+                    if (attrs.some(v => String(v).includes(anchor))) {{
+                        node.click();
+                        return true;
+                    }}
+                }}
+
+                // Fallback by searching script-rendered text in card root
+                const cards = document.querySelectorAll('li, section, article, div[class*="message"], div[class*="notice"]');
+                for (const card of cards) {{
+                    if (!(card instanceof HTMLElement) || !isVisible(card)) continue;
+                    const txt = (card.innerText || card.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!txt) continue;
+                    const html = card.outerHTML || '';
+                    if (html.includes(anchor)) {{
+                        card.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }})()
+        """)
+
+        if not clicked:
+            raise CDPError("notification_item_not_found")
+
+        deadline = time.time() + max(2.0, timeout_seconds)
+        while time.time() < deadline:
+            cur = self._evaluate("window.location.href")
+            if isinstance(cur, str) and "/explore/" in cur:
+                return {"success": True, "url": cur}
+            self._sleep(0.4, minimum_seconds=0.2)
+
+        raise CDPError("notification_item_open_timeout")
+
+    def _reply_directly_in_notification(
+        self,
+        target_comment_content: str,
+        reply_content: str,
+    ) -> dict[str, Any]:
+        """In notification page: click target card's 回复, fill textarea.comment-input, then send."""
+        target = (target_comment_content or "").strip()
+        if not target:
+            raise CDPError("target_comment_content is required for notification direct reply")
+
+        target_literal = json.dumps(target, ensure_ascii=False)
+        click_result = self._evaluate(f"""
+            (() => {{
+                const target = {target_literal};
+                const isVisible = (n) => {{
+                    if (!(n instanceof HTMLElement)) return false;
+                    const s = getComputedStyle(n);
+                    if (!s || s.display === 'none' || s.visibility === 'hidden') return false;
+                    const r = n.getBoundingClientRect();
+                    return r.width >= 6 && r.height >= 6;
+                }};
+                const cards = [...document.querySelectorAll('div.container')].filter(isVisible);
+                for (const c of cards) {{
+                    const t = (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!t || !t.includes(target)) continue;
+                    const reply = c.querySelector('.action-reply');
+                    if (!(reply instanceof HTMLElement) || !isVisible(reply)) continue;
+                    reply.click();
+                    return {{ ok: true, card_preview: t.slice(0, 160) }};
+                }}
+                return {{ ok: false, reason: 'notification_target_card_not_found' }};
+            }})()
+        """)
+        if not isinstance(click_result, dict) or not click_result.get("ok"):
+            reason = click_result.get("reason") if isinstance(click_result, dict) else "notification_click_unknown"
+            raise CDPError(f"notification_reply_click_failed: {reason}")
+
+        # Wait for inline textarea to appear
+        ready = False
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            has_input = self._evaluate("""
+                (() => {
+                    const el = document.querySelector('textarea.comment-input, textarea[placeholder*="回复"]');
+                    if (!(el instanceof HTMLTextAreaElement)) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width >= 8 && r.height >= 8;
+                })()
+            """)
+            if has_input:
+                ready = True
+                break
+            self._sleep(0.25, minimum_seconds=0.15)
+        if not ready:
+            raise CDPError("notification_reply_input_not_found")
+
+        filled_len = self._fill_comment_content(reply_content)
+        if filled_len <= 0:
+            raise CDPError("notification_reply_content_empty_after_fill")
+
+        submit_rect_js = """
+            (function() {
+                const isVisible = (node) => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    const style = window.getComputedStyle(node);
+                    if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+                    const r = node.getBoundingClientRect();
+                    return r.width >= 8 && r.height >= 8;
+                };
+                const nodes = document.querySelectorAll('button, .action-send, span, div[role="button"]');
+                for (const node of nodes) {
+                    if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+                    const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (text === '发送' || text === '回复' || text === '评论') {
+                        const r = node.getBoundingClientRect();
+                        return { x: r.x, y: r.y, width: r.width, height: r.height };
+                    }
+                }
+                return null;
+            })();
+        """
+        self._click_element_by_cdp("notification reply submit", submit_rect_js)
+        self._sleep(0.8, minimum_seconds=0.4)
+
+        return {
+            "success": True,
+            "mode": "notification_direct_reply",
+            "target_comment_content": target,
+            "content_length": filled_len,
+            "card_preview": click_result.get("card_preview", ""),
         }
 
     def get_notification_mentions(self, wait_seconds: float = 18.0) -> dict[str, Any]:
@@ -2834,6 +3093,7 @@ def main():
     p_reply.add_argument("--feed-id", required=True, help="Feed id")
     p_reply.add_argument("--xsec-token", required=True, help="xsec token")
     p_reply.add_argument("--anchor-comment-id", required=True, help="Anchor comment id from mentions")
+    p_reply.add_argument("--target-comment-content", help="Exact target comment content for strict match fallback")
     p_reply_content = p_reply.add_mutually_exclusive_group(required=True)
     p_reply_content.add_argument("--content", help="Reply content")
     p_reply_content.add_argument("--content-file", help="Read reply content from file")
@@ -3128,6 +3388,7 @@ def main():
                 xsec_token=args.xsec_token,
                 anchor_comment_id=args.anchor_comment_id,
                 content=reply_content,
+                target_comment_content=(args.target_comment_content or ""),
             )
             print("REPLY_COMMENT_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))

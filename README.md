@@ -264,10 +264,12 @@ python scripts/cdp_publish.py post-comment-to-feed --feed-id FEED_ID --xsec-toke
 python scripts/cdp_publish.py get-notification-mentions
 
 # 在评论和@场景回复某条评论（支持下划线别名：reply_to_comment_in_feed）
+# 建议传入 --target-comment-content，用于通知页精确命中目标评论，避免串线
 python scripts/cdp_publish.py reply-to-comment-in-feed \
   --feed-id FEED_ID \
   --xsec-token XSEC_TOKEN \
   --anchor-comment-id ANCHOR_COMMENT_ID \
+  --target-comment-content "目标评论原文" \
   --content "回复内容"
 
 # 获取内容数据表（支持下划线别名：content_data）
