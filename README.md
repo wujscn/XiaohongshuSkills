@@ -17,6 +17,7 @@
 - **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据）
 - **笔记评论**：支持按 `feed_id + xsec_token` 对指定笔记发表一级评论
 - **通知评论抓取**：支持在 `/notification` 页面抓取 `you/mentions` 接口返回
+- **二级回复增强**：通知页回复优先用 `anchor_comment_id` 精准定位，`--target-comment-content` 可选但建议提供；并启用严格投递校验（校验失败直接报错，不再返回伪成功），且当通知页直回无法验证送达时会自动回退到 feed 锚点重试
 - **内容数据看板抓取**：支持抓取“笔记基础信息”表（曝光/观看/点赞等）并导出 CSV
 
 ## 安装
@@ -176,6 +177,8 @@ python scripts/cdp_publish.py reply-to-comment-in-feed \
     --content "收到～感谢补充，我去试试！"
 ```
 
+说明：`reply-to-comment-in-feed` 至少需要 `--anchor-comment-id`；`--target-comment-content` 为可选增强参数，建议在可能重复评论文本时一并传入。
+说明：`reply-to-comment-in-feed` 会做对位与投递双重校验（通知页输入框对位 + feed 详情/API/DOM回查）；无法确认发出时会返回错误，而不是返回 `success=true`。若通知页直回未能验证送达，会自动切换到 feed 锚点回复并再次校验。
 说明：`search-feeds` 会先在搜索框输入关键词，抓取下拉推荐词（`recommended_keywords`），再回车拉取 feed 列表。
 
 ### 6. 获取内容数据表（content_data）
@@ -264,13 +267,16 @@ python scripts/cdp_publish.py post-comment-to-feed --feed-id FEED_ID --xsec-toke
 python scripts/cdp_publish.py get-notification-mentions
 
 # 在评论和@场景回复某条评论（支持下划线别名：reply_to_comment_in_feed）
-# 建议传入 --target-comment-content，用于通知页精确命中目标评论，避免串线
+# --target-comment-content 为可选增强参数；建议传入以减少同文案评论串线
 python scripts/cdp_publish.py reply-to-comment-in-feed \
   --feed-id FEED_ID \
   --xsec-token XSEC_TOKEN \
   --anchor-comment-id ANCHOR_COMMENT_ID \
   --target-comment-content "目标评论原文" \
   --content "回复内容"
+
+# 本地回归测试（覆盖二级回复关键流程）
+python -m unittest discover -s tests -p 'test_*.py' -v
 
 # 获取内容数据表（支持下划线别名：content_data）
 python scripts/cdp_publish.py content-data

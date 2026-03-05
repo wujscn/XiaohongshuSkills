@@ -296,6 +296,7 @@ class XiaohongshuPublisher:
         self.login_cache_ttl_hours = DEFAULT_LOGIN_CACHE_TTL_HOURS
         self.login_cache_ttl_seconds = self.login_cache_ttl_hours * 3600
         self.login_cache_file = LOGIN_CACHE_FILE
+        self._recent_cdp_events: list[dict[str, Any]] = []
 
     def _login_cache_key(self, scope: str) -> str:
         """Build a unique cache key for one login scope."""
@@ -524,7 +525,160 @@ class XiaohongshuPublisher:
                 if "error" in data:
                     raise CDPError(f"CDP error: {data['error']}")
                 return data.get("result", {})
-            # else: it's an event, skip it
+            # else: it's an event, keep a bounded cache for post-action probes
+            self._record_cdp_event(data)
+
+    def _record_cdp_event(self, message: dict[str, Any]):
+        """Cache recent CDP event messages for later probe/verification."""
+        if not isinstance(message, dict):
+            return
+        method = message.get("method")
+        if not isinstance(method, str) or not method:
+            return
+        self._recent_cdp_events.append({
+            "ts": time.time(),
+            "message": message,
+        })
+        if len(self._recent_cdp_events) > 4000:
+            self._recent_cdp_events = self._recent_cdp_events[-3000:]
+
+    def _probe_comment_post_api_from_recent_events(self, since_ts: float) -> dict[str, Any]:
+        """Inspect cached CDP events for comment post API response since `since_ts`."""
+        target_path = "/api/sns/web/v1/comment/post"
+        request_meta_by_id: dict[str, dict[str, Any]] = {}
+        target_request_id = ""
+        target_status: int | None = None
+        target_url = ""
+
+        for entry in self._recent_cdp_events:
+            if float(entry.get("ts", 0.0)) < float(since_ts):
+                continue
+            message = entry.get("message", {})
+            if not isinstance(message, dict):
+                continue
+            method = message.get("method")
+            params = message.get("params", {})
+            if not isinstance(params, dict):
+                continue
+
+            if method == "Network.requestWillBeSent":
+                request_id = params.get("requestId")
+                request = params.get("request", {})
+                if not isinstance(request_id, str) or not isinstance(request, dict):
+                    continue
+                req_url = str(request.get("url") or "")
+                req_method = str(request.get("method") or "").upper()
+                if target_path not in req_url or req_method != "POST":
+                    continue
+                request_meta_by_id[request_id] = {
+                    "url": req_url,
+                    "method": req_method,
+                }
+                continue
+
+            if method == "Network.responseReceived":
+                request_id = params.get("requestId")
+                if not isinstance(request_id, str):
+                    continue
+                response = params.get("response", {})
+                response_url = ""
+                response_status: int | None = None
+                if isinstance(response, dict):
+                    response_url = str(response.get("url") or "")
+                    status_raw = response.get("status")
+                    try:
+                        response_status = int(status_raw) if status_raw is not None else None
+                    except Exception:
+                        response_status = None
+                meta = request_meta_by_id.get(request_id, {})
+                url = str(meta.get("url") or response_url)
+                if target_path not in url:
+                    continue
+                target_request_id = request_id
+                target_url = url
+                target_status = response_status
+                break
+
+        if not target_request_id:
+            return {"found": False, "success": None, "reason": "network_event_not_found"}
+
+        if target_status is not None and target_status != 200:
+            return {
+                "found": True,
+                "success": False,
+                "status": target_status,
+                "url": target_url,
+                "reason": "network_non_200",
+            }
+
+        body_text = ""
+        try:
+            body_result = self._send("Network.getResponseBody", {"requestId": target_request_id})
+            body_text = str(body_result.get("body") or "")
+            if body_result.get("base64Encoded"):
+                body_text = base64.b64decode(body_text).decode("utf-8", errors="replace")
+        except Exception:
+            body_text = ""
+
+        parsed: dict[str, Any] | None = None
+        if body_text:
+            try:
+                payload = json.loads(body_text)
+                if isinstance(payload, dict):
+                    parsed = payload
+            except Exception:
+                parsed = None
+
+        api_success = bool(parsed and parsed.get("success") is True)
+        return {
+            "found": True,
+            "success": api_success,
+            "status": target_status,
+            "url": target_url,
+            "reason": "network_success_true" if api_success else "network_success_false_or_unparsed",
+            "body_preview": (body_text or "")[:280],
+        }
+
+    def _collect_cdp_events_for_duration(self, duration_seconds: float) -> int:
+        """Collect and cache CDP events for a short duration."""
+        if not self.ws:
+            return 0
+        deadline = time.time() + max(0.0, float(duration_seconds))
+        count = 0
+        while time.time() < deadline:
+            timeout = min(0.5, max(0.05, deadline - time.time()))
+            try:
+                raw = self.ws.recv(timeout=timeout)
+            except TimeoutError:
+                continue
+            except Exception:
+                break
+
+            try:
+                message = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(message, dict) and isinstance(message.get("method"), str):
+                self._record_cdp_event(message)
+                count += 1
+        return count
+
+    def _wait_for_comment_post_api_probe(
+        self,
+        since_ts: float,
+        timeout_seconds: float = 8.0,
+    ) -> dict[str, Any]:
+        """Wait briefly for comment-post API events and return probe result."""
+        deadline = time.time() + max(0.5, float(timeout_seconds))
+        latest_probe = {"found": False, "success": None, "reason": "network_event_not_found"}
+        while time.time() < deadline:
+            probe = self._probe_comment_post_api_from_recent_events(since_ts)
+            if isinstance(probe, dict):
+                latest_probe = probe
+                if probe.get("found"):
+                    return probe
+            self._collect_cdp_events_for_duration(0.4)
+        return latest_probe
 
     def _evaluate(self, expression: str) -> Any:
         """Execute JavaScript in the page and return the result value."""
@@ -1660,7 +1814,7 @@ class XiaohongshuPublisher:
                 }};
 
                 const getText = (node) => (node && (node.innerText || node.textContent || ""))
-                    .replace(/\s+/g, " ")
+                    .replace(/\\s+/g, " ")
                     .trim();
 
                 const clickExpandReplies = () => {{
@@ -1671,8 +1825,8 @@ class XiaohongshuPublisher:
                         const txt = getText(el);
                         if (!txt || txt.length > 30) continue;
                         if (/^(展开|查看|更多).{0,8}回复$/.test(txt)
-                            || /^共\d+条回复$/.test(txt)
-                            || /^回复\(\d+\)$/.test(txt)) {{
+                            || /^共\\d+条回复$/.test(txt)
+                            || /^回复\\(\\d+\\)$/.test(txt)) {{
                             try {{ el.click(); clicked += 1; }} catch (e) {{}}
                         }}
                     }}
@@ -1692,18 +1846,19 @@ class XiaohongshuPublisher:
                     return null;
                 }};
 
-                const escaped = (typeof CSS !== "undefined" && CSS.escape)
+                const escapedAnchor = (typeof CSS !== "undefined" && CSS.escape)
                     ? CSS.escape(anchorId)
-                    : anchorId.replace(/(["'\\.#:\[\]\(\)])/g, "\\$1");
+                    : anchorId;
 
                 const selectorCandidates = [
-                    `#comment-${{escaped}}`,
-                    `[id="comment-${{escaped}}"]`,
-                    `[data-comment-id="${{escaped}}"]`,
-                    `[id="${{escaped}}"]`,
-                    `[data-id="${{escaped}}"]`,
-                    `[data-commentid="${{escaped}}"]`,
-                    `[comment-id="${{escaped}}"]`,
+                    `#comment-${{escapedAnchor}}`,
+                    `#${{escapedAnchor}}`,
+                    `[id="comment-${{anchorId}}"]`,
+                    `[data-comment-id="${{anchorId}}"]`,
+                    `[id="${{anchorId}}"]`,
+                    `[data-id="${{anchorId}}"]`,
+                    `[data-commentid="${{anchorId}}"]`,
+                    `[comment-id="${{anchorId}}"]`,
                 ];
 
                 const findTargetNodeByAnchor = () => {{
@@ -1711,11 +1866,28 @@ class XiaohongshuPublisher:
                         const node = document.querySelector(sel);
                         if (node instanceof HTMLElement) return node;
                     }}
+                    const nodes = document.querySelectorAll('[id], [data-comment-id], [data-id], [data-commentid], [comment-id], a[href], [data-href], [data-url]');
+                    for (const node of nodes) {{
+                        if (!(node instanceof HTMLElement)) continue;
+                        const attrs = [
+                            node.id || "",
+                            node.getAttribute('data-comment-id') || "",
+                            node.getAttribute('data-id') || "",
+                            node.getAttribute('data-commentid') || "",
+                            node.getAttribute('comment-id') || "",
+                            node.getAttribute('href') || "",
+                            node.getAttribute('data-href') || "",
+                            node.getAttribute('data-url') || "",
+                        ];
+                        if (attrs.some((v) => String(v || "").includes(anchorId))) {{
+                            return node;
+                        }}
+                    }}
                     return null;
                 }};
 
                 const findTargetNodeByContent = () => {{
-                    const needle = (targetCommentText || "").replace(/\s+/g, " ").trim();
+                    const needle = (targetCommentText || "").replace(/\\s+/g, " ").trim();
                     if (!needle) return null;
                     const nodes = document.querySelectorAll('.comment-item, li, .comment, [class*="comment"], p, span, div');
                     for (const node of nodes) {{
@@ -1763,9 +1935,10 @@ class XiaohongshuPublisher:
         return {"ok": False, "reason": "unexpected_eval_result"}
 
     def _submit_reply_in_current_context(self) -> None:
-        """Click reply/comment send button in current page context."""
+        """Click reply/comment send button around the active comment input."""
         submit_rect_js = """
             (function() {
+                const norm = (text) => (text || "").replace(/\\s+/g, " ").trim();
                 const isVisible = (node) => {
                     if (!(node instanceof HTMLElement)) return false;
                     const style = window.getComputedStyle(node);
@@ -1779,37 +1952,293 @@ class XiaohongshuPublisher:
                     if (node.closest("header, .search-container, .search-box, .search-input")) return true;
                     return false;
                 };
-                const inCommentContext = (node) => {
+                const inReplyUiContext = (node) => {
                     if (!(node instanceof HTMLElement)) return false;
                     if (isSearchInputNode(node)) return false;
                     let cur = node;
-                    for (let i = 0; i < 8 && cur; i += 1) {
+                    for (let i = 0; i < 10 && cur; i += 1) {
                         const cls = String(cur.className || "").toLowerCase();
                         const id = String(cur.id || "").toLowerCase();
-                        if (cls.includes("comment") || cls.includes("input") || cls.includes("reply") || id.includes("comment")) {
+                        if (
+                            cls.includes("comment")
+                            || cls.includes("reply")
+                            || cls.includes("input")
+                            || cls.includes("engage")
+                            || cls.includes("interact")
+                            || cls.includes("bottom")
+                            || id.includes("comment")
+                            || id.includes("reply")
+                        ) {
                             return true;
                         }
                         cur = cur.parentElement;
                     }
                     return false;
                 };
-
-                const buttons = document.querySelectorAll("button, .action-send, span, a, div[role='button']");
-                for (const button of buttons) {
-                    if (!(button instanceof HTMLElement)) continue;
-                    if (!isVisible(button) || !inCommentContext(button)) continue;
-                    if ((button instanceof HTMLButtonElement) && button.disabled) continue;
-                    const text = (button.textContent || "").replace(/\s+/g, " ").trim();
-                    if (text === "发送" || text === "评论" || text === "回复" || text === "Send" || text === "Reply") {
-                        const r = button.getBoundingClientRect();
-                        return { x: r.x, y: r.y, width: r.width, height: r.height };
+                const unique = (nodes) => {
+                    const seen = new Set();
+                    const out = [];
+                    for (const node of nodes) {
+                        if (!(node instanceof HTMLElement)) continue;
+                        if (seen.has(node)) continue;
+                        seen.add(node);
+                        out.push(node);
                     }
+                    return out;
+                };
+                const findActiveInput = () => {
+                    const focusEl = document.activeElement;
+                    if (focusEl instanceof HTMLElement && !isSearchInputNode(focusEl)) {
+                        if (
+                            focusEl.isContentEditable
+                            || focusEl.matches("textarea, input, [role='textbox'], #content-textarea")
+                        ) {
+                            return focusEl;
+                        }
+                    }
+                    const selectors = [
+                        "#content-textarea",
+                        "div.input-box div.content-edit [contenteditable='true']",
+                        "textarea.comment-input",
+                        "textarea[placeholder*='回复']",
+                        "textarea[placeholder*='评论']",
+                        "textarea[placeholder*='说点什么']",
+                        "[role='textbox']",
+                    ];
+                    for (const selector of selectors) {
+                        const nodes = document.querySelectorAll(selector);
+                        for (const node of nodes) {
+                            if (!(node instanceof HTMLElement)) continue;
+                            if (!isVisible(node) || isSearchInputNode(node)) continue;
+                            return node;
+                        }
+                    }
+                    return null;
+                };
+                const collectScopes = (input) => {
+                    const roots = [
+                        input,
+                        input ? input.closest(".engage-bar.active") : null,
+                        input ? input.closest(".engage-bar") : null,
+                        input ? input.closest(".engage-bar-container") : null,
+                        input ? input.closest(".input-box") : null,
+                        input ? input.closest(".comment-container, .comment-input-container") : null,
+                        input ? input.closest("[class*='comment']") : null,
+                        input ? input.closest("[class*='reply']") : null,
+                        input ? input.parentElement : null,
+                        document.body,
+                    ];
+                    return unique(roots);
+                };
+                const scoreNode = (node) => {
+                    const text = norm(node.textContent || "");
+                    const cls = String(node.className || "").toLowerCase();
+                    let score = 0;
+                    if (text === "发送" || text === "Send") score += 180;
+                    else if (text.includes("发送")) score += 140;
+                    if (
+                        (text === "评论" || text === "Comment")
+                        && (cls.includes("send") || cls.includes("submit"))
+                    ) {
+                        score += 70;
+                    }
+                    if (cls.includes("submit")) score += 50;
+                    if (cls.includes("send")) score += 45;
+                    if (cls.includes("btn")) score += 8;
+                    if (cls.includes("cancel") || text.includes("取消")) score -= 220;
+                    if (text === "回复" || text === "Reply" || text.includes("回复")) score -= 240;
+                    if (!inReplyUiContext(node)) score -= 60;
+                    return score;
+                };
+                const pickBest = (scope) => {
+                    if (!(scope instanceof HTMLElement)) return null;
+                    const selectors = [
+                        ".right-btn-area button.btn.submit",
+                        ".right-btn-area button.submit",
+                        ".right-btn-area button",
+                        ".bottom button.btn.submit",
+                        ".bottom button.submit",
+                        "button.btn.submit",
+                        "button[class*='submit']",
+                        "button[class*='send']",
+                        ".action-send",
+                        "button",
+                        "[role='button']",
+                        "span",
+                        "a",
+                        "div[role='button']",
+                    ];
+                    let best = null;
+                    const seen = new Set();
+                    for (const selector of selectors) {
+                        const nodes = scope.querySelectorAll(selector);
+                        for (const node of nodes) {
+                            if (!(node instanceof HTMLElement)) continue;
+                            if (seen.has(node)) continue;
+                            seen.add(node);
+                            if (!isVisible(node) || isSearchInputNode(node)) continue;
+                            if ((node instanceof HTMLButtonElement) && node.disabled) continue;
+                            const score = scoreNode(node);
+                            if (score < 40) continue;
+                            const rect = node.getBoundingClientRect();
+                            const candidate = {
+                                score,
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height,
+                            };
+                            if (!best || candidate.score > best.score) {
+                                best = candidate;
+                            }
+                        }
+                        if (best && best.score >= 170) {
+                            break;
+                        }
+                    }
+                    return best;
+                };
+
+                const input = findActiveInput();
+                const scopes = collectScopes(input);
+                let best = null;
+                for (const scope of scopes) {
+                    const candidate = pickBest(scope);
+                    if (!candidate) continue;
+                    if (!best || candidate.score > best.score) {
+                        best = candidate;
+                    }
+                    if (best.score >= 170) break;
                 }
-                return null;
+                if (!best) return null;
+                return {
+                    x: best.x,
+                    y: best.y,
+                    width: best.width,
+                    height: best.height,
+                };
             })();
         """
         self._click_element_by_cdp("reply submit button", submit_rect_js)
         self._sleep(1.0, minimum_seconds=0.4)
+
+    def _reply_via_feed_anchor_fallback(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        anchor_comment_id: str,
+        target_comment_content: str,
+        reply_content: str,
+        fallback_from: str,
+        fallback_reason: str,
+    ) -> dict[str, Any]:
+        """Reply in feed detail by anchor and capture comment-post API probe."""
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        self._navigate(detail_url)
+        self._sleep(1.2, minimum_seconds=0.6)
+        self._check_feed_page_accessible()
+
+        focus_result = self._focus_reply_target_for_anchor(
+            anchor_comment_id=anchor_comment_id,
+            target_comment_content=target_comment_content,
+        )
+        if not isinstance(focus_result, dict) or not focus_result.get("ok"):
+            reason = focus_result.get("reason") if isinstance(focus_result, dict) else "unknown"
+            raise CDPError(f"reply_focus_failed_after_notification_fallback: {reason}")
+
+        filled_len = self._fill_comment_content(reply_content)
+        self._sleep(0.5, minimum_seconds=0.2)
+
+        probe_since_ts = 0.0
+        if self.ws and hasattr(self.ws, "send") and hasattr(self.ws, "recv"):
+            self._send("Network.enable", {"maxPostDataSize": 65536})
+            probe_since_ts = time.time()
+        self._submit_reply_in_current_context()
+
+        event_probe: dict[str, Any] = {"found": False, "success": None, "reason": "network_event_not_found"}
+        if probe_since_ts > 0:
+            event_probe = self._wait_for_comment_post_api_probe(
+                since_ts=probe_since_ts,
+                timeout_seconds=6.0,
+            )
+        api_probe_found = bool(isinstance(event_probe, dict) and event_probe.get("found"))
+        api_success = bool(isinstance(event_probe, dict) and event_probe.get("success") is True)
+        api_status = event_probe.get("status") if isinstance(event_probe, dict) else None
+        api_probe_reason = (
+            str(event_probe.get("reason", "network_event_not_found"))
+            if isinstance(event_probe, dict)
+            else "network_event_not_found"
+        )
+
+        return {
+            "success": True,
+            "mode": "feed_anchor_fallback",
+            "target_comment_content": target_comment_content,
+            "target_preview": focus_result.get("target_preview", ""),
+            "content_length": filled_len,
+            "fallback_from": fallback_from,
+            "fallback_reason": fallback_reason,
+            "api_probe_found": api_probe_found,
+            "api_status": api_status,
+            "api_success": api_success,
+            "api_probe_reason": api_probe_reason,
+        }
+
+    def _verify_reply_delivery(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        anchor_comment_id: str,
+        reply_content: str,
+        target_comment_content: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify reply delivery by API probe, feed detail API, then feed DOM."""
+        api_verified = bool(payload.get("api_success") is True)
+        content_found = False
+        dom_check: dict[str, Any] = {"ok": False, "reason": "not_checked"}
+
+        if not api_verified:
+            for _ in range(4):
+                try:
+                    detail = self.get_feed_detail(feed_id, xsec_token)
+                    detail_raw = json.dumps(detail, ensure_ascii=False)
+                    if reply_content and reply_content in detail_raw:
+                        content_found = True
+                        break
+                except Exception:
+                    pass
+                self._sleep(0.6, minimum_seconds=0.3)
+
+            if not content_found:
+                detail_url = make_feed_detail_url(feed_id, xsec_token)
+                self._navigate(detail_url)
+                self._sleep(1.2, minimum_seconds=0.6)
+                self._check_feed_page_accessible()
+                dom_check = self._verify_reply_visible_in_feed_page(
+                    anchor_comment_id=anchor_comment_id,
+                    reply_content=reply_content,
+                    target_comment_content=target_comment_content,
+                    timeout_seconds=7.0,
+                )
+
+        delivery_verified = api_verified or content_found or bool(dom_check.get("ok"))
+        if api_verified:
+            delivery_check = "comment_post_api"
+            probe_reason = str(payload.get("api_probe_reason", "comment_post_api_success"))
+        elif content_found:
+            delivery_check = "feed_detail_api"
+            probe_reason = "feed_detail_contains_reply"
+        else:
+            delivery_check = "feed_page_dom"
+            probe_reason = str(dom_check.get("reason", ""))
+
+        return {
+            "delivery_verified": delivery_verified,
+            "delivery_check": delivery_check,
+            "delivery_probe_reason": probe_reason,
+            "dom_reason": str(dom_check.get("reason", "unknown")),
+        }
 
     def reply_to_comment_in_feed(
         self,
@@ -1835,81 +2264,85 @@ class XiaohongshuPublisher:
         if not clean_content:
             raise CDPError("Reply content is empty.")
 
-        # Strict mode: mentions replies must include exact target text.
-        if not clean_target_comment:
-            raise CDPError("target_comment_content is required for strict mentions reply")
-
         self._navigate(XHS_NOTIFICATION_URL)
         self._sleep(1.0, minimum_seconds=0.5)
         clicked_tab = self._schedule_click_notification_mentions_tab()
         if not clicked_tab:
             raise CDPError("notification_tab_not_found")
-
-        verify_marker = f"__xhsv{int(time.time())}"
-        verify_content = f"{clean_content} {verify_marker}".strip()
+        self._sleep(0.8, minimum_seconds=0.3)
 
         # Primary path: in-notification direct reply.
+        direct_error: CDPError | None = None
         try:
             payload = self._reply_directly_in_notification(
                 target_comment_content=clean_target_comment,
-                reply_content=verify_content,
+                anchor_comment_id=clean_anchor,
+                reply_content=clean_content,
             )
         except CDPError as direct_err:
+            direct_error = direct_err
             print(f"[cdp_publish] notification direct reply failed, fallback to feed anchor: {direct_err}")
-
-            detail_url = make_feed_detail_url(clean_feed_id, clean_token)
-            self._navigate(detail_url)
-            self._sleep(1.2, minimum_seconds=0.6)
-            self._check_feed_page_accessible()
-
-            focus_result = self._focus_reply_target_for_anchor(
+            payload = self._reply_via_feed_anchor_fallback(
+                feed_id=clean_feed_id,
+                xsec_token=clean_token,
                 anchor_comment_id=clean_anchor,
                 target_comment_content=clean_target_comment,
+                reply_content=clean_content,
+                fallback_from="notification_direct_reply",
+                fallback_reason=str(direct_err),
             )
-            if not isinstance(focus_result, dict) or not focus_result.get("ok"):
-                reason = focus_result.get("reason") if isinstance(focus_result, dict) else "unknown"
-                raise CDPError(f"reply_focus_failed_after_notification_fallback: {reason}")
 
-            filled_len = self._fill_comment_content(verify_content)
-            self._sleep(0.5, minimum_seconds=0.2)
-            self._submit_reply_in_current_context()
+        verify = self._verify_reply_delivery(
+            feed_id=clean_feed_id,
+            xsec_token=clean_token,
+            anchor_comment_id=clean_anchor,
+            reply_content=clean_content,
+            target_comment_content=clean_target_comment,
+            payload=payload,
+        )
 
-            payload = {
-                "success": True,
-                "mode": "feed_anchor_fallback",
-                "target_comment_content": clean_target_comment,
-                "target_preview": focus_result.get("target_preview", ""),
-                "content_length": filled_len,
-                "fallback_from": "notification_direct_reply",
-                "fallback_reason": str(direct_err),
-            }
+        # If notification direct reply returned "ok" but cannot be verified,
+        # switch to feed-anchor fallback and retry once.
+        if (
+            not verify.get("delivery_verified")
+            and payload.get("mode") == "notification_direct_reply"
+        ):
+            fallback_reason = str(verify.get("delivery_probe_reason", "delivery_unverified"))
+            if direct_error is not None:
+                fallback_reason = f"{fallback_reason}; direct_err={direct_error}"
+            print(
+                "[cdp_publish] notification direct reply delivery unverified, "
+                f"fallback to feed anchor retry: {fallback_reason}"
+            )
+            payload = self._reply_via_feed_anchor_fallback(
+                feed_id=clean_feed_id,
+                xsec_token=clean_token,
+                anchor_comment_id=clean_anchor,
+                target_comment_content=clean_target_comment,
+                reply_content=clean_content,
+                fallback_from="notification_direct_unverified",
+                fallback_reason=fallback_reason,
+            )
+            verify = self._verify_reply_delivery(
+                feed_id=clean_feed_id,
+                xsec_token=clean_token,
+                anchor_comment_id=clean_anchor,
+                reply_content=clean_content,
+                target_comment_content=clean_target_comment,
+                payload=payload,
+            )
 
-        # Verify delivery.
-        # Primary: marker appears in feed detail API payload.
-        marker_found = False
-        for _ in range(4):
-            try:
-                detail = self.get_feed_detail(clean_feed_id, clean_token)
-                detail_raw = json.dumps(detail, ensure_ascii=False)
-                if verify_marker in detail_raw:
-                    marker_found = True
-                    break
-            except Exception:
-                pass
-            self._sleep(0.6, minimum_seconds=0.3)
-
-        # Fallback: if marker check fails but we used explicit feed-anchor fallback,
-        # trust local UI send success and continue as delivered (API often lags/filters).
-        delivery_verified = marker_found or payload.get("mode") == "feed_anchor_fallback"
-        if not delivery_verified:
-            raise CDPError("notification_reply_not_delivered")
+        if not verify.get("delivery_verified"):
+            reason = verify.get("dom_reason", "unknown")
+            raise CDPError(f"notification_reply_not_delivered: feed_api=false, feed_dom={reason}")
 
         payload.update({
             "feed_id": clean_feed_id,
             "xsec_token": clean_token,
             "anchor_comment_id": clean_anchor,
-            "delivery_verified": delivery_verified,
-            "delivery_check": "marker" if marker_found else "fallback_ui_success",
+            "delivery_verified": bool(verify.get("delivery_verified")),
+            "delivery_check": str(verify.get("delivery_check", "unknown")),
+            "delivery_probe_reason": str(verify.get("delivery_probe_reason", "")),
         })
         return payload
 
@@ -2096,7 +2529,7 @@ class XiaohongshuPublisher:
                 const cards = document.querySelectorAll('li, section, article, div[class*="message"], div[class*="notice"]');
                 for (const card of cards) {{
                     if (!(card instanceof HTMLElement) || !isVisible(card)) continue;
-                    const txt = (card.innerText || card.textContent || '').replace(/\s+/g, ' ').trim();
+                    const txt = (card.innerText || card.textContent || '').replace(/\\s+/g, ' ').trim();
                     if (!txt) continue;
                     const html = card.outerHTML || '';
                     if (html.includes(anchor)) {{
@@ -2124,22 +2557,30 @@ class XiaohongshuPublisher:
         self,
         target_comment_content: str,
         reply_content: str,
+        anchor_comment_id: str = "",
     ) -> dict[str, Any]:
         """In notification page: reply inside exact target card scope only."""
         target = (target_comment_content or "").strip()
         content = (reply_content or "").strip()
+        anchor = (anchor_comment_id or "").strip()
         if not target:
-            raise CDPError("target_comment_content is required for notification direct reply")
+            if not anchor:
+                raise CDPError("target_comment_content or anchor_comment_id is required for notification direct reply")
         if not content:
             raise CDPError("reply_content is required")
 
         target_literal = json.dumps(target, ensure_ascii=False)
+        anchor_literal = json.dumps(anchor, ensure_ascii=False)
         content_literal = json.dumps(content, ensure_ascii=False)
+        self._send("Network.enable", {"maxPostDataSize": 65536})
+        probe_since_ts = time.time()
 
         result = self._evaluate(f"""
-            (() => {{
+            (async () => {{
                 const targetRaw = {target_literal};
+                const anchorRaw = {anchor_literal};
                 const content = {content_literal};
+                const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
                 const isVisible = (n) => {{
                     if (!(n instanceof HTMLElement)) return false;
@@ -2148,8 +2589,9 @@ class XiaohongshuPublisher:
                     const r = n.getBoundingClientRect();
                     return r.width >= 6 && r.height >= 6;
                 }};
-                const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
+                const norm = (t) => (t || '').replace(/\\s+/g, ' ').trim();
                 const target = norm(targetRaw);
+                const anchor = norm(anchorRaw);
                 const targetHead = target.slice(0, Math.min(14, target.length));
                 const targetTail = target.slice(Math.max(0, target.length - 10));
 
@@ -2176,29 +2618,50 @@ class XiaohongshuPublisher:
                     }}
                 }}
 
-                const scoreCard = (text) => {{
-                    if (!text) return -1;
-                    if (text.includes(target)) return 100;
+                const scoreCard = (card) => {{
+                    if (!(card instanceof HTMLElement)) return -1;
+                    const text = norm(card.innerText || card.textContent || '');
+                    const html = String(card.outerHTML || '');
+                    if (!text && !html) return -1;
                     let score = 0;
-                    if (targetHead && text.includes(targetHead)) score += 35;
-                    if (targetTail && text.includes(targetTail)) score += 25;
-                    const tShort = target.slice(0, 8);
-                    if (tShort && text.includes(tShort)) score += 20;
+                    if (anchor) {{
+                        if (html.includes(anchor)) score += 1000;
+                        const attrs = [
+                            card.id || '',
+                            card.getAttribute('data-comment-id') || '',
+                            card.getAttribute('data-id') || '',
+                            card.getAttribute('data-commentid') || '',
+                            card.getAttribute('comment-id') || '',
+                            card.getAttribute('href') || '',
+                            card.getAttribute('data-href') || '',
+                            card.getAttribute('data-url') || '',
+                        ];
+                        if (attrs.some((v) => String(v || '').includes(anchor))) {{
+                            score += 1200;
+                        }}
+                    }}
+                    if (target) {{
+                        if (text.includes(target)) score += 120;
+                        if (targetHead && text.includes(targetHead)) score += 35;
+                        if (targetTail && text.includes(targetTail)) score += 25;
+                        const tShort = target.slice(0, 8);
+                        if (tShort && text.includes(tShort)) score += 20;
+                    }}
                     return score;
                 }};
 
                 let card = null;
                 let bestScore = -1;
                 for (const c of cards) {{
-                    const t = norm(c.innerText || c.textContent || '');
-                    const score = scoreCard(t);
+                    const score = scoreCard(c);
                     if (score > bestScore) {{
                         bestScore = score;
                         card = c;
                     }}
                 }}
 
-                if (!(card instanceof HTMLElement) || bestScore < 20) {{
+                const minScore = anchor ? 200 : 20;
+                if (!(card instanceof HTMLElement) || bestScore < minScore) {{
                     return {{
                         ok: false,
                         reason: 'notification_target_card_not_found',
@@ -2207,7 +2670,7 @@ class XiaohongshuPublisher:
                     }};
                 }}
 
-                const findByText = (scope, words) => {{
+                const findByText = (scope, words, exact = false) => {{
                     if (!(scope instanceof HTMLElement)) return null;
                     const nodes = scope.querySelectorAll('button, span, a, div[role="button"], div');
                     for (const n of nodes) {{
@@ -2215,20 +2678,138 @@ class XiaohongshuPublisher:
                         const txt = norm(n.textContent || '');
                         if (!txt) continue;
                         for (const w of words) {{
-                            if (txt === w || txt.includes(w)) return n;
+                            const nw = norm(w);
+                            if ((exact && txt === nw) || (!exact && (txt === nw || txt.includes(nw)))) {{
+                                return n;
+                            }}
                         }}
                     }}
                     return null;
                 }};
+                const getPlaceholder = (node) => {{
+                    if (!(node instanceof HTMLElement)) return "";
+                    if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {{
+                        return norm(node.getAttribute("placeholder") || node.placeholder || "");
+                    }}
+                    const attrs = [
+                        node.getAttribute("placeholder") || "",
+                        node.getAttribute("data-placeholder") || "",
+                        node.getAttribute("aria-label") || "",
+                    ];
+                    for (const v of attrs) {{
+                        const t = norm(v);
+                        if (t) return t;
+                    }}
+                    return "";
+                }};
+                const parseJsonMaybe = (text) => {{
+                    if (!text) return null;
+                    try {{
+                        return JSON.parse(String(text));
+                    }} catch (_) {{
+                        return null;
+                    }}
+                }};
+                const installCommentPostProbe = () => {{
+                    if (window.__xhsCommentPostProbeInstalled) return;
+                    window.__xhsCommentPostProbeInstalled = true;
+                    window.__xhsLastCommentPost = null;
+                    const targetPath = "/api/sns/web/v1/comment/post";
 
-                const scopes = [card, card.parentElement, card.parentElement?.parentElement].filter(Boolean);
+                    const capture = (payload) => {{
+                        try {{
+                            window.__xhsLastCommentPost = {{
+                                ts: Date.now(),
+                                transport: payload.transport || "",
+                                url: payload.url || "",
+                                method: payload.method || "",
+                                status: Number(payload.status || 0),
+                                body: String(payload.body || ""),
+                            }};
+                        }} catch (_) {{
+                            // ignored
+                        }}
+                    }};
+
+                    const originalFetch = window.fetch.bind(window);
+                    window.fetch = async (...args) => {{
+                        const req = args[0];
+                        const init = args[1] || {{}};
+                        const url = typeof req === "string" ? req : (req && req.url) || "";
+                        const method = String((init && init.method) || "GET").toUpperCase();
+                        const resp = await originalFetch(...args);
+                        if (String(url).includes(targetPath) || String(resp.url || "").includes(targetPath)) {{
+                            let body = "";
+                            try {{
+                                body = await resp.clone().text();
+                            }} catch (_) {{
+                                body = "";
+                            }}
+                            capture({{
+                                transport: "fetch",
+                                url: String(resp.url || url || ""),
+                                method,
+                                status: resp.status,
+                                body,
+                            }});
+                        }}
+                        return resp;
+                    }};
+
+                    const xhrProto = XMLHttpRequest.prototype;
+                    const originalOpen = xhrProto.open;
+                    const originalSend = xhrProto.send;
+
+                    xhrProto.open = function(method, url, ...rest) {{
+                        this.__xhsMethod = String(method || "").toUpperCase();
+                        this.__xhsUrl = String(url || "");
+                        return originalOpen.call(this, method, url, ...rest);
+                    }};
+
+                    xhrProto.send = function(...args) {{
+                        try {{
+                            const url = String(this.__xhsUrl || "");
+                            if (url.includes(targetPath)) {{
+                                this.addEventListener("loadend", () => {{
+                                    capture({{
+                                        transport: "xhr",
+                                        url,
+                                        method: String(this.__xhsMethod || "POST"),
+                                        status: this.status,
+                                        body: String(this.responseText || ""),
+                                    }});
+                                }});
+                            }}
+                        }} catch (_) {{
+                            // ignored
+                        }}
+                        return originalSend.apply(this, args);
+                    }};
+                }};
+
+                const collectScopes = () => {{
+                    const raw = [card, card.parentElement, card.parentElement?.parentElement, document.body];
+                    const seen = new Set();
+                    const scopes = [];
+                    for (const node of raw) {{
+                        if (!(node instanceof HTMLElement)) continue;
+                        if (seen.has(node)) continue;
+                        seen.add(node);
+                        scopes.push(node);
+                    }}
+                    return scopes;
+                }};
 
                 let replyBtn = card.querySelector('.action-reply');
                 if (!(replyBtn instanceof HTMLElement) || !isVisible(replyBtn)) {{
+                    const scopes = collectScopes();
                     for (const scope of scopes) {{
                         replyBtn = scope.querySelector('.action-reply, [class*="reply"]');
-                        if (replyBtn instanceof HTMLElement && isVisible(replyBtn)) break;
-                        replyBtn = findByText(scope, ['回复', 'Reply']);
+                        if (replyBtn instanceof HTMLElement && isVisible(replyBtn)) {{
+                            const txt = norm(replyBtn.textContent || '');
+                            if (txt === '回复' || txt === 'reply') break;
+                        }}
+                        replyBtn = findByText(scope, ['回复', 'Reply'], true);
                         if (replyBtn) break;
                     }}
                 }}
@@ -2239,20 +2820,37 @@ class XiaohongshuPublisher:
 
                 card.scrollIntoView({{ block: 'center', inline: 'nearest' }});
                 card.click();
+                await sleep(80);
                 replyBtn.click();
 
                 let input = null;
                 for (let i = 0; i < 36; i += 1) {{
+                    const scopes = collectScopes();
                     for (const scope of scopes) {{
-                        input = scope.querySelector('textarea.comment-input, textarea[placeholder*="回复"], textarea[placeholder*="评论"], textarea[placeholder*="说点什么"], textarea');
-                        if (input instanceof HTMLTextAreaElement && isVisible(input)) break;
-                        input = scope.querySelector('[contenteditable="true"]');
-                        if (input instanceof HTMLElement && isVisible(input)) break;
+                        const candidates = scope.querySelectorAll('textarea.comment-input, textarea[placeholder*="回复"], textarea[placeholder*="评论"], textarea[placeholder*="说点什么"], textarea, [contenteditable="true"]');
+                        for (const candidate of candidates) {{
+                            if (!(candidate instanceof HTMLElement)) continue;
+                            if (!isVisible(candidate)) continue;
+                            const placeholder = norm(candidate.getAttribute('placeholder') || '');
+                            if (placeholder.includes('搜索')) continue;
+                            input = candidate;
+                            break;
+                        }}
+                        if (input) break;
                         input = null;
                     }}
                     if (input) break;
-                    const start = Date.now();
-                    while (Date.now() - start < 100) {{}}
+                    await sleep(120);
+                }}
+
+                const lockedPlaceholder = getPlaceholder(input);
+                if (lockedPlaceholder && !lockedPlaceholder.includes("回复") && !lockedPlaceholder.toLowerCase().includes("reply")) {{
+                    return {{
+                        ok: false,
+                        reason: "notification_reply_placeholder_mismatch",
+                        placeholder: lockedPlaceholder,
+                        best_score: bestScore,
+                    }};
                 }}
 
                 let filled = false;
@@ -2274,52 +2872,315 @@ class XiaohongshuPublisher:
                 }}
 
                 let sendEl = null;
+                const scopes = collectScopes();
                 for (const scope of scopes) {{
-                    sendEl = scope.querySelector('.action-send, [class*="send"]');
-                    if (sendEl instanceof HTMLElement && isVisible(sendEl)) break;
-                    sendEl = findByText(scope, ['发送', '回复', '评论', 'Send']);
+                    const nodes = scope.querySelectorAll('button, [role="button"], a, span, div');
+                    for (const node of nodes) {{
+                        if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+                        if ((node instanceof HTMLButtonElement) && node.disabled) continue;
+                        const text = norm(node.textContent || '');
+                        if (!text) continue;
+                        if (text === '发送' || text === 'Send') {{
+                            sendEl = node;
+                            break;
+                        }}
+                    }}
+                    if (sendEl) break;
+                    for (const node of nodes) {{
+                        if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+                        if ((node instanceof HTMLButtonElement) && node.disabled) continue;
+                        const text = norm(node.textContent || '');
+                        if (!text || text.includes('取消')) continue;
+                        const cls = norm(String(node.className || '')).toLowerCase();
+                        if (cls.includes('action-send') || cls.includes('send')) {{
+                            sendEl = node;
+                            break;
+                        }}
+                    }}
+                    if (sendEl) break;
+                    sendEl = findByText(scope, ['发送', 'Send'], true);
                     if (sendEl) break;
                 }}
 
-                if (sendEl instanceof HTMLElement) {{
-                    sendEl.click();
-                }} else {{
-                    const focusTarget = (input instanceof HTMLElement) ? input : card;
-                    focusTarget.focus();
-                    const evDown = new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', bubbles: true }});
-                    const evUp = new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', bubbles: true }});
-                    focusTarget.dispatchEvent(evDown);
-                    focusTarget.dispatchEvent(evUp);
+                if (!(sendEl instanceof HTMLElement) || !isVisible(sendEl) || sendEl === replyBtn) {{
+                    return {{
+                        ok: false,
+                        reason: "notification_send_btn_not_found",
+                        best_score: bestScore,
+                    }};
                 }}
+
+                const placeholderBeforeSend = getPlaceholder(input);
+                if (
+                    lockedPlaceholder
+                    && placeholderBeforeSend
+                    && lockedPlaceholder !== placeholderBeforeSend
+                ) {{
+                    return {{
+                        ok: false,
+                        reason: "notification_reply_placeholder_drift",
+                        placeholder: placeholderBeforeSend,
+                        best_score: bestScore,
+                    }};
+                }}
+
+                const sendRectRaw = sendEl.getBoundingClientRect();
+                const sendRect = {{
+                    x: sendRectRaw.x,
+                    y: sendRectRaw.y,
+                    width: sendRectRaw.width,
+                    height: sendRectRaw.height,
+                }};
 
                 return {{
                     ok: true,
-                    reason: 'ok',
+                    reason: 'ready_to_send',
                     card_preview: norm(card.innerText || card.textContent || '').slice(0, 180),
                     used_scope: 'notification_card',
+                    placeholder: lockedPlaceholder,
+                    send_rect: sendRect,
                     best_score: bestScore,
                     candidate_count: cards.length,
                 }};
             }})()
         """)
+        if isinstance(result, dict) and result.get("ok"):
+            send_rect = result.get("send_rect") if isinstance(result, dict) else None
+            if not isinstance(send_rect, dict):
+                raise CDPError("notification_reply_failed: notification_send_rect_missing")
+            try:
+                cx = float(send_rect["x"]) + float(send_rect["width"]) / 2.0
+                cy = float(send_rect["y"]) + float(send_rect["height"]) / 2.0
+            except Exception as exc:
+                raise CDPError("notification_reply_failed: notification_send_rect_invalid") from exc
+
+            probe_since_ts = time.time()
+            self._click_mouse(cx, cy)
+            self._sleep(0.4, minimum_seconds=0.15)
+
+        if isinstance(result, dict) and result.get("ok"):
+            event_probe = self._wait_for_comment_post_api_probe(
+                since_ts=probe_since_ts,
+                timeout_seconds=8.0,
+            )
+            if isinstance(event_probe, dict):
+                result["api_probe_found"] = bool(event_probe.get("found"))
+                result["api_status"] = event_probe.get("status")
+                result["api_success"] = event_probe.get("success")
+                result["api_probe_reason"] = event_probe.get("reason", "")
+                if event_probe.get("body_preview"):
+                    result["api_body"] = event_probe.get("body_preview")
+
+                explicit_api_fail = bool(
+                    event_probe.get("reason") == "network_non_200"
+                    or (
+                        event_probe.get("success") is False
+                        and isinstance(event_probe.get("body_preview"), str)
+                        and bool(str(event_probe.get("body_preview")).strip())
+                    )
+                )
+                if explicit_api_fail:
+                    result["ok"] = False
+                    result["reason"] = "notification_reply_api_failed"
 
         if not isinstance(result, dict) or not result.get("ok"):
             reason = result.get("reason") if isinstance(result, dict) else "notification_reply_unknown"
             details = ""
             if isinstance(result, dict):
-                details = f", best_score={result.get('best_score')}, candidates={result.get('candidates', result.get('candidate_count'))}"
+                details = (
+                    f", best_score={result.get('best_score')}, "
+                    f"candidates={result.get('candidates', result.get('candidate_count'))}, "
+                    f"api_status={result.get('api_status')}, api_body={result.get('api_body')}"
+                )
             raise CDPError(f"notification_reply_failed: {reason}{details}")
 
         return {
             "success": True,
             "mode": "notification_direct_reply",
             "target_comment_content": target,
+            "anchor_comment_id": anchor,
             "content_length": len(content),
             "card_preview": result.get("card_preview", ""),
             "used_scope": result.get("used_scope", "unknown"),
+            "placeholder": result.get("placeholder", ""),
+            "api_probe_found": bool(result.get("api_probe_found")),
+            "api_status": result.get("api_status"),
+            "api_success": result.get("api_success"),
+            "api_probe_reason": result.get("api_probe_reason", ""),
             "best_score": result.get("best_score"),
             "candidate_count": result.get("candidate_count"),
         }
+
+    def _verify_reply_visible_in_feed_page(
+        self,
+        anchor_comment_id: str,
+        reply_content: str,
+        target_comment_content: str = "",
+        timeout_seconds: float = 7.0,
+    ) -> dict[str, Any]:
+        """Verify reply text is visible in feed page comment scope."""
+        anchor = (anchor_comment_id or "").strip()
+        reply = (reply_content or "").strip()
+        target = (target_comment_content or "").strip()
+        if not anchor:
+            return {"ok": False, "reason": "anchor_comment_id_empty"}
+        if not reply:
+            return {"ok": False, "reason": "reply_content_empty"}
+
+        anchor_literal = json.dumps(anchor, ensure_ascii=False)
+        reply_literal = json.dumps(reply, ensure_ascii=False)
+        target_literal = json.dumps(target, ensure_ascii=False)
+
+        deadline = time.time() + max(2.0, float(timeout_seconds))
+        last_reason = "verify_timeout"
+        last_preview = ""
+
+        while time.time() < deadline:
+            result = self._evaluate(f"""
+                (() => {{
+                    const anchorId = {anchor_literal};
+                    const replyText = {reply_literal};
+                    const targetText = {target_literal};
+
+                    const norm = (t) => (t || "").replace(/\\s+/g, " ").trim();
+                    const isVisible = (node) => {{
+                        if (!(node instanceof HTMLElement)) return false;
+                        const style = window.getComputedStyle(node);
+                        if (!style || style.display === "none" || style.visibility === "hidden") return false;
+                        const rect = node.getBoundingClientRect();
+                        return rect.width >= 4 && rect.height >= 4;
+                    }};
+                    const getText = (node) => norm(node && (node.innerText || node.textContent || ""));
+                    const attrContainsAnchor = (node) => {{
+                        if (!(node instanceof HTMLElement)) return false;
+                        const attrs = [
+                            node.id || "",
+                            node.getAttribute("data-comment-id") || "",
+                            node.getAttribute("data-id") || "",
+                            node.getAttribute("data-commentid") || "",
+                            node.getAttribute("comment-id") || "",
+                            node.getAttribute("href") || "",
+                            node.getAttribute("data-href") || "",
+                            node.getAttribute("data-url") || "",
+                        ];
+                        return attrs.some((v) => String(v || "").includes(anchorId));
+                    }};
+                    const clickExpandIn = (scope) => {{
+                        if (!(scope instanceof HTMLElement)) return 0;
+                        const nodes = scope.querySelectorAll("button, span, a, div[role='button']");
+                        let clicked = 0;
+                        for (const node of nodes) {{
+                            if (!(node instanceof HTMLElement) || !isVisible(node)) continue;
+                            const txt = getText(node);
+                            if (!txt || txt.length > 30) continue;
+                            if (/^(展开|查看|更多).{0,8}回复$/.test(txt)
+                                || /^共\\d+条回复$/.test(txt)
+                                || /^回复\\(\\d+\\)$/.test(txt)) {{
+                                try {{
+                                    node.click();
+                                    clicked += 1;
+                                }} catch (e) {{
+                                    // ignored
+                                }}
+                            }}
+                        }}
+                        return clicked;
+                    }};
+                    const dedupe = (nodes) => {{
+                        const seen = new Set();
+                        const out = [];
+                        for (const node of nodes) {{
+                            if (!(node instanceof HTMLElement)) continue;
+                            if (seen.has(node)) continue;
+                            seen.add(node);
+                            out.push(node);
+                        }}
+                        return out;
+                    }};
+
+                    const allNodes = document.querySelectorAll(
+                        "[id], [data-comment-id], [data-id], [data-commentid], [comment-id], a[href], [data-href], [data-url], .comment-item, li, .comment, [class*='comment']"
+                    );
+                    const anchorNodes = [];
+                    for (const node of allNodes) {{
+                        if (!(node instanceof HTMLElement)) continue;
+                        if (!attrContainsAnchor(node)) continue;
+                        anchorNodes.push(node);
+                    }}
+
+                    let roots = [];
+                    for (const node of anchorNodes) {{
+                        const root = node.closest(".comment-item, li, .comment, [class*='comment'], article, section")
+                            || node.parentElement
+                            || node;
+                        roots.push(root);
+                        if (root.parentElement) roots.push(root.parentElement);
+                        if (root.parentElement && root.parentElement.parentElement) {{
+                            roots.push(root.parentElement.parentElement);
+                        }}
+                    }}
+
+                    if (!roots.length) {{
+                        const targetNeedle = norm(targetText);
+                        if (targetNeedle) {{
+                            const candidates = document.querySelectorAll(".comment-item, li, .comment, [class*='comment'], p, span, div");
+                            for (const node of candidates) {{
+                                if (!(node instanceof HTMLElement)) continue;
+                                const txt = getText(node);
+                                if (!txt || !txt.includes(targetNeedle)) continue;
+                                const root = node.closest(".comment-item, li, .comment, [class*='comment'], article, section")
+                                    || node.parentElement
+                                    || node;
+                                roots.push(root);
+                                if (root.parentElement) roots.push(root.parentElement);
+                            }}
+                        }}
+                    }}
+
+                    roots = dedupe(roots).filter(isVisible);
+                    if (!roots.length) {{
+                        return {{ ok: false, reason: "verify_scope_not_found" }};
+                    }}
+
+                    for (const root of roots) {{
+                        clickExpandIn(root);
+                    }}
+
+                    const replyNeedle = norm(replyText);
+                    if (!replyNeedle) {{
+                        return {{ ok: false, reason: "verify_reply_empty" }};
+                    }}
+
+                    for (const root of roots) {{
+                        const nodes = root.querySelectorAll(".comment-item, li, .comment, [class*='comment'], p, span, div");
+                        for (const node of nodes) {{
+                            if (!(node instanceof HTMLElement)) continue;
+                            const txt = getText(node);
+                            if (!txt || txt.length < 2) continue;
+                            if (txt === replyNeedle || txt.includes(replyNeedle)) {{
+                                return {{
+                                    ok: true,
+                                    reason: "reply_found_in_feed_dom",
+                                    preview: txt.slice(0, 180),
+                                }};
+                            }}
+                        }}
+                    }}
+
+                    return {{ ok: false, reason: "reply_not_found_in_feed_dom" }};
+                }})()
+            """)
+
+            if isinstance(result, dict):
+                if result.get("ok"):
+                    return result
+                last_reason = str(result.get("reason") or last_reason)
+                last_preview = str(result.get("preview") or "")
+            else:
+                last_reason = "unexpected_eval_result"
+            self._sleep(0.7, minimum_seconds=0.25)
+
+        return {"ok": False, "reason": last_reason, "preview": last_preview}
 
     def get_notification_mentions(self, wait_seconds: float = 18.0) -> dict[str, Any]:
         """
@@ -3259,7 +4120,10 @@ def main():
     p_reply.add_argument("--feed-id", required=True, help="Feed id")
     p_reply.add_argument("--xsec-token", required=True, help="xsec token")
     p_reply.add_argument("--anchor-comment-id", required=True, help="Anchor comment id from mentions")
-    p_reply.add_argument("--target-comment-content", help="Exact target comment content for strict match fallback")
+    p_reply.add_argument(
+        "--target-comment-content",
+        help="Exact target comment content (recommended). Improves precision when duplicate comments exist.",
+    )
     p_reply_content = p_reply.add_mutually_exclusive_group(required=True)
     p_reply_content.add_argument("--content", help="Reply content")
     p_reply_content.add_argument("--content-file", help="Read reply content from file")
