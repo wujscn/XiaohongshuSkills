@@ -1786,52 +1786,26 @@ class XiaohongshuPublisher:
         if not clean_content:
             raise CDPError("Reply content is empty.")
 
-        if clean_target_comment:
-            # Preferred path for mentions: reply directly in /notification card to avoid wrong-thread replies.
-            self._navigate(XHS_NOTIFICATION_URL)
-            self._sleep(1.0, minimum_seconds=0.5)
-            clicked_tab = self._schedule_click_notification_mentions_tab()
-            if clicked_tab:
-                try:
-                    direct_payload = self._reply_directly_in_notification(
-                        target_comment_content=clean_target_comment,
-                        reply_content=clean_content,
-                    )
-                    direct_payload.update({
-                        "feed_id": clean_feed_id,
-                        "xsec_token": clean_token,
-                        "anchor_comment_id": clean_anchor,
-                    })
-                    return direct_payload
-                except CDPError:
-                    pass
+        # Strict mode: mentions replies must be posted from /notification reply context only.
+        if not clean_target_comment:
+            raise CDPError("target_comment_content is required for strict mentions reply")
 
-        detail_url = (
-            f"{XHS_EXPLORE_BASE_URL}/{quote(clean_feed_id)}"
-            f"?xsec_token={quote(clean_token)}"
-            "&xsec_source=pc_feed"
-            f"&anchorCommentId={quote(clean_anchor)}"
-        )
-        print(f"[cdp_publish] Opening notification context for anchor {clean_anchor}")
-        try:
-            opened = self.open_notification_item_context(clean_anchor, timeout_seconds=12.0)
-            print(f"[cdp_publish] Opened from notification: {opened.get('url')}")
-        except CDPError:
-            print(f"[cdp_publish] Fallback navigate to {detail_url}")
-            self._navigate(detail_url)
-            self._sleep(2.2, minimum_seconds=1.0)
+        self._navigate(XHS_NOTIFICATION_URL)
+        self._sleep(1.0, minimum_seconds=0.5)
+        clicked_tab = self._schedule_click_notification_mentions_tab()
+        if not clicked_tab:
+            raise CDPError("notification_tab_not_found")
 
-        focus_result = self._focus_reply_target_for_anchor(
-            clean_anchor,
+        direct_payload = self._reply_directly_in_notification(
             target_comment_content=clean_target_comment,
+            reply_content=clean_content,
         )
-        if not focus_result.get("ok"):
-            raise CDPError(f"reply_target_not_found: {focus_result.get('reason')}")
-
-        self._sleep(0.8, minimum_seconds=0.4)
-        filled_len = self._fill_comment_content(clean_content)
-        if filled_len <= 0:
-            raise CDPError("reply_content_empty_after_fill")
+        direct_payload.update({
+            "feed_id": clean_feed_id,
+            "xsec_token": clean_token,
+            "anchor_comment_id": clean_anchor,
+        })
+        return direct_payload
 
         submit_rect_js = """
             (function() {
