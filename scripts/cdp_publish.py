@@ -2092,7 +2092,7 @@ class XiaohongshuPublisher:
 
         result = self._evaluate(f"""
             (() => {{
-                const target = {target_literal};
+                const targetRaw = {target_literal};
                 const content = {content_literal};
 
                 const isVisible = (n) => {{
@@ -2103,43 +2103,102 @@ class XiaohongshuPublisher:
                     return r.width >= 6 && r.height >= 6;
                 }};
                 const norm = (t) => (t || '').replace(/\s+/g, ' ').trim();
+                const target = norm(targetRaw);
+                const targetHead = target.slice(0, Math.min(14, target.length));
+                const targetTail = target.slice(Math.max(0, target.length - 10));
 
-                const cards = [...document.querySelectorAll('div.container')].filter(isVisible);
-                let card = null;
-                for (const c of cards) {{
-                    const t = norm(c.innerText || c.textContent || '');
-                    if (!t) continue;
-                    if (t.includes(target)) {{
-                        card = c;
-                        break;
+                const candidateCardSelectors = [
+                    'div.container',
+                    'li',
+                    'article',
+                    'section',
+                    'div[class*="item"]',
+                    'div[class*="notice"]',
+                    'div[class*="message"]',
+                    'div[class*="comment"]',
+                ];
+
+                const cardSet = new Set();
+                const cards = [];
+                for (const sel of candidateCardSelectors) {{
+                    for (const node of document.querySelectorAll(sel)) {{
+                        if (!(node instanceof HTMLElement)) continue;
+                        if (!isVisible(node)) continue;
+                        if (cardSet.has(node)) continue;
+                        cardSet.add(node);
+                        cards.push(node);
                     }}
                 }}
-                if (!card) {{
-                    return {{ ok: false, reason: 'notification_target_card_not_found' }};
+
+                const scoreCard = (text) => {{
+                    if (!text) return -1;
+                    if (text.includes(target)) return 100;
+                    let score = 0;
+                    if (targetHead && text.includes(targetHead)) score += 35;
+                    if (targetTail && text.includes(targetTail)) score += 25;
+                    const tShort = target.slice(0, 8);
+                    if (tShort && text.includes(tShort)) score += 20;
+                    return score;
+                }};
+
+                let card = null;
+                let bestScore = -1;
+                for (const c of cards) {{
+                    const t = norm(c.innerText || c.textContent || '');
+                    const score = scoreCard(t);
+                    if (score > bestScore) {{
+                        bestScore = score;
+                        card = c;
+                    }}
                 }}
 
-                const replyBtn = card.querySelector('.action-reply');
+                if (!(card instanceof HTMLElement) || bestScore < 20) {{
+                    return {{
+                        ok: false,
+                        reason: 'notification_target_card_not_found',
+                        candidates: cards.length,
+                        best_score: bestScore,
+                    }};
+                }}
+
+                const findByText = (scope, words) => {{
+                    if (!(scope instanceof HTMLElement)) return null;
+                    const nodes = scope.querySelectorAll('button, span, a, div[role="button"], div');
+                    for (const n of nodes) {{
+                        if (!(n instanceof HTMLElement) || !isVisible(n)) continue;
+                        const txt = norm(n.textContent || '');
+                        if (!txt) continue;
+                        for (const w of words) {{
+                            if (txt === w || txt.includes(w)) return n;
+                        }}
+                    }}
+                    return null;
+                }};
+
+                const scopes = [card, card.parentElement, card.parentElement?.parentElement].filter(Boolean);
+
+                let replyBtn = card.querySelector('.action-reply');
                 if (!(replyBtn instanceof HTMLElement) || !isVisible(replyBtn)) {{
-                    return {{ ok: false, reason: 'notification_reply_btn_not_found' }};
+                    for (const scope of scopes) {{
+                        replyBtn = scope.querySelector('.action-reply, [class*="reply"]');
+                        if (replyBtn instanceof HTMLElement && isVisible(replyBtn)) break;
+                        replyBtn = findByText(scope, ['回复', 'Reply']);
+                        if (replyBtn) break;
+                    }}
                 }}
 
-                // Some notification layouts only show inline input after card focus.
+                if (!(replyBtn instanceof HTMLElement) || !isVisible(replyBtn)) {{
+                    return {{ ok: false, reason: 'notification_reply_btn_not_found', best_score: bestScore }};
+                }}
+
+                card.scrollIntoView({{ block: 'center', inline: 'nearest' }});
                 card.click();
                 replyBtn.click();
 
-                // Composer may be lazy-mounted; wait briefly for send action first.
-                for (let i = 0; i < 16; i += 1) {{
-                    const sendProbe = card.querySelector('.action-send');
-                    if (sendProbe instanceof HTMLElement && isVisible(sendProbe)) break;
-                    const start = Date.now();
-                    while (Date.now() - start < 120) {{}}
-                }}
-
                 let input = null;
-                const scopes = [card, card.parentElement, card.parentElement?.parentElement].filter(Boolean);
-                for (let i = 0; i < 24; i += 1) {{
+                for (let i = 0; i < 36; i += 1) {{
                     for (const scope of scopes) {{
-                        input = scope.querySelector('textarea.comment-input, textarea[placeholder*="回复"], textarea[placeholder*="评论"], textarea[placeholder*="说点什么"]');
+                        input = scope.querySelector('textarea.comment-input, textarea[placeholder*="回复"], textarea[placeholder*="评论"], textarea[placeholder*="说点什么"], textarea');
                         if (input instanceof HTMLTextAreaElement && isVisible(input)) break;
                         input = scope.querySelector('[contenteditable="true"]');
                         if (input instanceof HTMLElement && isVisible(input)) break;
@@ -2147,7 +2206,7 @@ class XiaohongshuPublisher:
                     }}
                     if (input) break;
                     const start = Date.now();
-                    while (Date.now() - start < 120) {{}}
+                    while (Date.now() - start < 100) {{}}
                 }}
 
                 let filled = false;
@@ -2164,28 +2223,21 @@ class XiaohongshuPublisher:
                     filled = true;
                 }}
 
+                if (!filled) {{
+                    return {{ ok: false, reason: 'notification_input_not_found', best_score: bestScore }};
+                }}
+
                 let sendEl = null;
-                const sendScopes = [card, card.parentElement, card.parentElement?.parentElement].filter(Boolean);
-                for (const scope of sendScopes) {{
-                    sendEl = scope.querySelector('.action-send');
+                for (const scope of scopes) {{
+                    sendEl = scope.querySelector('.action-send, [class*="send"]');
                     if (sendEl instanceof HTMLElement && isVisible(sendEl)) break;
-                    sendEl = null;
-                    const candidates = scope.querySelectorAll('button, span, a, div[role="button"]');
-                    for (const el of candidates) {{
-                        if (!(el instanceof HTMLElement) || !isVisible(el)) continue;
-                        const t = norm(el.textContent || '');
-                        if (t === '发送' || t === '回复' || t === '评论') {{
-                            sendEl = el;
-                            break;
-                        }}
-                    }}
+                    sendEl = findByText(scope, ['发送', '回复', '评论', 'Send']);
                     if (sendEl) break;
                 }}
 
-                if (filled && (sendEl instanceof HTMLElement)) {{
+                if (sendEl instanceof HTMLElement) {{
                     sendEl.click();
                 }} else {{
-                    // Keyboard fallback: focus reply area and dispatch Enter.
                     const focusTarget = (input instanceof HTMLElement) ? input : card;
                     focusTarget.focus();
                     const evDown = new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', bubbles: true }});
@@ -2193,18 +2245,24 @@ class XiaohongshuPublisher:
                     focusTarget.dispatchEvent(evDown);
                     focusTarget.dispatchEvent(evUp);
                 }}
+
                 return {{
                     ok: true,
                     reason: 'ok',
                     card_preview: norm(card.innerText || card.textContent || '').slice(0, 180),
-                    used_scope: 'card',
+                    used_scope: 'notification_card',
+                    best_score: bestScore,
+                    candidate_count: cards.length,
                 }};
             }})()
         """)
 
         if not isinstance(result, dict) or not result.get("ok"):
             reason = result.get("reason") if isinstance(result, dict) else "notification_reply_unknown"
-            raise CDPError(f"notification_reply_failed: {reason}")
+            details = ""
+            if isinstance(result, dict):
+                details = f", best_score={result.get('best_score')}, candidates={result.get('candidates', result.get('candidate_count'))}"
+            raise CDPError(f"notification_reply_failed: {reason}{details}")
 
         return {
             "success": True,
@@ -2213,6 +2271,8 @@ class XiaohongshuPublisher:
             "content_length": len(content),
             "card_preview": result.get("card_preview", ""),
             "used_scope": result.get("used_scope", "unknown"),
+            "best_score": result.get("best_score"),
+            "candidate_count": result.get("candidate_count"),
         }
 
     def get_notification_mentions(self, wait_seconds: float = 18.0) -> dict[str, Any]:
